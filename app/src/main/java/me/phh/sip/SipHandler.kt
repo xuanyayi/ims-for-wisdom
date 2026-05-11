@@ -183,6 +183,7 @@ class SipHandler(val ctxt: Context) {
     // This is especially important for incoming INVITE over the TCP server socket: writing the
     // 180/200 to the registration/control socket can make the P-CSCF ignore the final response.
     private val requestWriters = java.util.concurrent.ConcurrentHashMap<String, OutputStream>()
+    private val reconnecting = AtomicBoolean(false)
     private var imsReady = false
     var imsReadyCallback: (() -> Unit)? = null
     var imsFailureCallback: (() -> Unit)? = null
@@ -274,15 +275,111 @@ class SipHandler(val ctxt: Context) {
         return true
     }
 
+    private fun resetRegistrationStateForConnect() {
+        registerCounter = 1
+        registerHeaders =
+            """
+        From: <sip:$user>
+        To: <sip:$user>
+        """.toSipHeadersMap() + generateCallId()
+        commonHeaders = "".toSipHeadersMap()
+        contact = ""
+        mySip = ""
+        myTel = ""
+        imsReady = false
+    }
+
+    private fun getPcscfServers(lp: LinkProperties): List<InetAddress> {
+        return (lp.javaClass.getMethod("getPcscfServers").invoke(lp) as List<*>)
+            .filterIsInstance<InetAddress>()
+            .sortedBy { if (it is Inet6Address) 0 else 1 }
+    }
+
+    private fun getImsLocalAddress(lp: LinkProperties): InetAddress? {
+        return lp.linkAddresses
+            .map { it.address }
+            .filter { !it.isAnyLocalAddress && !it.isLoopbackAddress }
+            .sortedBy { if (it is Inet6Address) 0 else 1 }
+            .firstOrNull()
+    }
+
+    private fun clearCallAndCallbackStateForReconnect() {
+        callStopped.set(true)
+        callStarted.set(false)
+        threadsStarted.set(false)
+        incomingFinalResponseSent.set(false)
+        incomingAcceptedAwaitingAck.set(false)
+        incomingHangupAfterAck.set(false)
+        currentCall = null
+        callGeneration.incrementAndGet()
+        synchronized(prAckWaitLock) {
+            prAckWait.clear()
+            prAckWaitLock.notifyAll()
+        }
+        cbLock.withLock {
+            requestCallbacks = mapOf()
+            responseCallbacks = mapOf()
+        }
+        requestWriters.clear()
+        smsLock.withLock { smsHeadersMap.clear() }
+    }
+
+    private fun closeSipTransports(reason: String) {
+        Rlog.w(TAG, "Closing SIP transports: $reason")
+        try { if (this::plainSocket.isInitialized) plainSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "close plainSocket failed", t) }
+        try { if (this::socket.isInitialized) socket.close() } catch (t: Throwable) { Rlog.d(TAG, "close socket failed", t) }
+        try { if (this::serverSocket.isInitialized) serverSocket.serverSocket.close() } catch (t: Throwable) { Rlog.d(TAG, "close TCP server failed", t) }
+        try { if (this::serverSocketUdp.isInitialized) serverSocketUdp.socket.close() } catch (t: Throwable) { Rlog.d(TAG, "close UDP server failed", t) }
+    }
+
+    private fun dropImsConnection(reason: String) {
+        clearCallAndCallbackStateForReconnect()
+        closeSipTransports(reason)
+        resetRegistrationStateForConnect()
+    }
+
+    private fun reconnectIms(reason: String, newNetwork: Network? = null, delayMs: Long = 1000L) {
+        if (!reconnecting.compareAndSet(false, true)) {
+            Rlog.w(TAG, "IMS reconnect already running, ignore: $reason")
+            return
+        }
+        thread {
+            try {
+                Rlog.w(TAG, "Reconnecting IMS: $reason")
+                dropImsConnection(reason)
+                if (newNetwork != null) network = newNetwork
+                Thread.sleep(delayMs)
+                if (!this@SipHandler::network.isInitialized) {
+                    Rlog.w(TAG, "Cannot reconnect IMS without a Network")
+                    imsFailureCallback?.invoke()
+                    return@thread
+                }
+                connect()
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "IMS reconnect failed: $reason", t)
+                imsFailureCallback?.invoke()
+            } finally {
+                reconnecting.set(false)
+            }
+        }
+    }
+
     var abandonnedBecauseOfNoPcscf = false
+    @Synchronized
     fun connect() {
         abandonnedBecauseOfNoPcscf = false
+        resetRegistrationStateForConnect()
         Rlog.d(TAG, "Trying to connect to SIP server")
         val lp = connectivityManager.getLinkProperties(network)
         Rlog.d(TAG, "Got link properties $lp")
-        val pcscfs = (lp!!.javaClass.getMethod("getPcscfServers").invoke(lp) as List<*>).sortedBy { if(it is Inet6Address) 0 else 1 }
+        if (lp == null) {
+            Rlog.w(TAG, "No link properties for IMS network")
+            imsFailureCallback?.invoke()
+            return
+        }
+        val pcscfs = getPcscfServers(lp)
         val pcscf = if (pcscfs.isNotEmpty()) {
-            pcscfs[0] as InetAddress
+            pcscfs[0]
         } else {
             // RIL didn't provide P-CSCF via LinkProperties. Try standard 3GPP DNS discovery
             // (TS 23.003 §13.2): resolve the well-known IMS domain for this PLMN.
@@ -304,7 +401,13 @@ class SipHandler(val ctxt: Context) {
             }
         }
 
-        localAddr = lp.linkAddresses.map { it.address }.sortedBy { if(it is Inet6Address) 0 else 1 }.first()
+        val newLocalAddr = getImsLocalAddress(lp)
+        if (newLocalAddr == null) {
+            Rlog.w(TAG, "No usable local address on IMS link properties")
+            imsFailureCallback?.invoke()
+            return
+        }
+        localAddr = newLocalAddr
         pcscfAddr = pcscf
 
         Rlog.w(TAG, "Connecting with address $localAddr to $pcscfAddr")
@@ -477,11 +580,7 @@ class SipHandler(val ctxt: Context) {
             } catch(t: Throwable) {
                 Rlog.w(TAG, "Got exception in main/control socket, reconnecting", t)
             }
-            socket.close()
-            try { connect() } catch (t: Throwable) {
-                Rlog.e(TAG, "Reconnect after main socket loss failed", t)
-                imsFailureCallback?.invoke()
-            }
+            reconnectIms("main/control SIP socket lost")
         }
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -537,8 +636,14 @@ class SipHandler(val ctxt: Context) {
                     Rlog.d(TAG, "IMS network unavailable")
                 }
 
-                override fun onLost(network: Network) {
-                    Rlog.d(TAG, "IMS network lost")
+                override fun onLost(lostNetwork: Network) {
+                    Rlog.d(TAG, "IMS network lost $lostNetwork")
+                    if (this@SipHandler::network.isInitialized && network == lostNetwork) {
+                        Rlog.w(TAG, "Current IMS network was lost; dropping SIP state")
+                        dropImsConnection("IMS network lost")
+                        abandonnedBecauseOfNoPcscf = true
+                        imsFailureCallback?.invoke()
+                    }
                 }
 
                 override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
@@ -561,22 +666,36 @@ class SipHandler(val ctxt: Context) {
                     linkProperties: LinkProperties
                 ) {
                     Rlog.d(TAG, "IMS network link properties changed $linkProperties")
-                    val pcscfs = linkProperties!!.javaClass.getMethod("getPcscfServers").invoke(linkProperties) as List<*>
-                    Rlog.d(TAG, "Got pcscfs $pcscfs")
-                    if(pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
-                        // Switch to this network if it has P-CSCF (could be a different bearer)
-                        network = _network
-                        try {
-                            connect()
-                        } catch (e: Throwable) {
-                            Rlog.e(TAG, "connect() from onLinkPropertiesChanged failed: $e")
-                        }
+                    val pcscfs = getPcscfServers(linkProperties)
+                    val newLocalAddr = getImsLocalAddress(linkProperties)
+                    val newPcscfAddr = pcscfs.firstOrNull()
+                    Rlog.d(TAG, "Got pcscfs $pcscfs local=$newLocalAddr")
+
+                    if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
+                        // Switch to this network if it has P-CSCF (could be a different bearer).
+                        reconnectIms("P-CSCF appeared after previous no-P-CSCF state", _network)
+                        return
+                    }
+
+                    if (!this@SipHandler::network.isInitialized) return
+
+                    val oldLocalAddr = if (this@SipHandler::localAddr.isInitialized) localAddr else null
+                    val oldPcscfAddr = if (this@SipHandler::pcscfAddr.isInitialized) pcscfAddr else null
+                    val networkChanged = network != _network
+                    val localChanged = oldLocalAddr != null && newLocalAddr != null && oldLocalAddr != newLocalAddr
+                    val pcscfChanged = oldPcscfAddr != null && newPcscfAddr != null && oldPcscfAddr != newPcscfAddr
+
+                    if (networkChanged || localChanged || pcscfChanged) {
+                        reconnectIms(
+                            "IMS link changed networkChanged=$networkChanged oldLocal=$oldLocalAddr newLocal=$newLocalAddr oldPcscf=$oldPcscfAddr newPcscf=$newPcscfAddr",
+                            _network
+                        )
                     }
                 }
 
                 override fun onAvailable(_network: Network) {
-                    Rlog.d(TAG, "Got IMS network.")
-                    if (!this@SipHandler::network.isInitialized || abandonnedBecauseOfNoPcscf) {
+                    Rlog.d(TAG, "Got IMS network $_network")
+                    if (!this@SipHandler::network.isInitialized) {
                         network = _network
                         thread {
                             Thread.sleep(4000)
@@ -586,8 +705,10 @@ class SipHandler(val ctxt: Context) {
                                 Rlog.e(TAG, "connect() failed: $e")
                             }
                         }
+                    } else if (abandonnedBecauseOfNoPcscf || network != _network) {
+                        reconnectIms("new IMS network available old=${network} new=$_network abandoned=$abandonnedBecauseOfNoPcscf", _network, delayMs = 4000L)
                     } else {
-                        Rlog.d(TAG, "... don't try anything")
+                        Rlog.d(TAG, "... already using this IMS network")
                     }
                 }
             }
@@ -1484,8 +1605,21 @@ a=sendrecv
             threadsStarted.set(false)
             callGeneration.incrementAndGet()
 
-            val rtpSocket = DatagramSocket(0, localAddr)
-            network.bindSocket(rtpSocket)
+            val rtpSocket = try {
+                DatagramSocket(0, localAddr)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Failed to bind outgoing RTP socket to $localAddr; IMS address is likely stale", t)
+                reconnectIms("outgoing RTP bind failed for localAddr=$localAddr")
+                return@thread
+            }
+            try {
+                network.bindSocket(rtpSocket)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Failed to bind outgoing RTP socket to IMS network", t)
+                try { rtpSocket.close() } catch (_: Throwable) {}
+                reconnectIms("outgoing RTP network.bindSocket failed")
+                return@thread
+            }
             rtpSocket.soTimeout = 2000
             // Connect later once the remote RTP address/port is known from SDP.
             Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort} timeout=${rtpSocket.soTimeout}")
@@ -1971,9 +2105,22 @@ a=sendrecv
         thread {
             // Need to sleep a bit so that our 100 Trying is sent first. Kinda weird.
             Thread.sleep(500)
-            val rtpSocket = DatagramSocket(0, localAddr)
-            network.bindSocket(rtpSocket)
-            rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            val rtpSocket = try {
+                DatagramSocket(0, localAddr)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Failed to bind incoming RTP socket to $localAddr; IMS address is likely stale", t)
+                reconnectIms("incoming RTP bind failed for localAddr=$localAddr")
+                return@thread
+            }
+            try {
+                network.bindSocket(rtpSocket)
+                rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Failed to bind/connect incoming RTP socket", t)
+                try { rtpSocket.close() } catch (_: Throwable) {}
+                reconnectIms("incoming RTP bind/connect failed")
+                return@thread
+            }
             Rlog.d(TAG, "RTP socket created: local=${rtpSocket.localAddress}:${rtpSocket.localPort}, remote=${rtpSocket.inetAddress}:${rtpSocket.port}")
 
             val local =
