@@ -1251,10 +1251,11 @@ a=sendrecv
                 }
                 val timestamp = sequenceNumber * 160
                 Thread.sleep(20)
+                val sendCall = currentCall ?: call
                 val rtpHeader = listOf(
                     // RTP
                     0x80, //rtp version
-                    call.amrTrack, //payload type
+                    sendCall.amrTrack, //payload type
                     (sequenceNumber shr 8), (sequenceNumber and 0xff),
                     (timestamp shr 24), ((timestamp shr 16) and 0xff), ((timestamp shr 8) and 0xff), (timestamp and 0xff),
                     0x03, 0x00, 0xd2, 0x00, //SSRC
@@ -1264,8 +1265,8 @@ a=sendrecv
                 val buf = (rtpHeader + amrNothing).map { it.toUByte() }.toUByteArray().toByteArray()
 
                 val dgramPacket =
-                    DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
-                call.rtpSocket.send(dgramPacket)
+                    DatagramPacket(buf, buf.size, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort)
+                sendCall.rtpSocket.send(dgramPacket)
                 sequenceNumber++
             }
             Rlog.d(TAG, "Silence loop exited after $sequenceNumber packets, starting real encoding")
@@ -1376,9 +1377,10 @@ a=sendrecv
 
                         // Every 20 ms, at 8 kHz, we have 160 samples
                         val timestamp = sequenceNumber * 160
+                        val sendCall = currentCall ?: break
                         val rtpHeader = byteArrayOf(
                             0x80.toByte(),
-                            ((if (firstPacket) 0x80 else 0) or call.amrTrack).toByte(),
+                            ((if (firstPacket) 0x80 else 0) or sendCall.amrTrack).toByte(),
                             (sequenceNumber shr 8).toByte(), (sequenceNumber and 0xff).toByte(),
                             (timestamp shr 24).toByte(), ((timestamp shr 16) and 0xff).toByte(),
                             ((timestamp shr 8) and 0xff).toByte(), (timestamp and 0xff).toByte(),
@@ -1390,17 +1392,17 @@ a=sendrecv
                             byteArrayOf(beByte0.toByte(), beByte1.toByte()) +
                             beRest.map { it.toByte() }.toByteArray()
 
-                        val dgramPacket = DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
+                        val dgramPacket = DatagramPacket(buf, buf.size, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort)
                         try {
-                            call.rtpSocket.send(dgramPacket)
+                            sendCall.rtpSocket.send(dgramPacket)
                             if (realFrameCount < 10) {
-                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp payload=${buf.drop(12).take(4).joinToString(" ") { "%02x".format(it) }}... to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp payload=${buf.drop(12).take(4).joinToString(" ") { "%02x".format(it) }}... to ${sendCall.rtpRemoteAddr}:${sendCall.rtpRemotePort}")
                             }
                             if (realFrameCount == 0) {
                                 Rlog.d(TAG, "First RTP packet full hex: ${buf.joinToString(" ") { "%02x".format(it) }}")
                             }
                             if (sequenceNumber % 50 == 0 && realFrameCount >= 10) {
-                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp to ${sendCall.rtpRemoteAddr}:${sendCall.rtpRemotePort}")
                             }
                         } catch (e: Exception) {
                             Rlog.e(TAG, "Failed to send RTP packet #$sequenceNumber: ${e.message}", e)
@@ -2031,9 +2033,130 @@ a=sendrecv
 
     val prAckWaitLock = Object()
     var prAckWait = mutableSetOf<Int>()
+
+    private fun handleInDialogInvite(request: SipRequest, call: Call, responseWriter: OutputStream): Int {
+        val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val cseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+        val sdp = request.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
+        Rlog.d(TAG, "Handling in-dialog INVITE: callId=$callId cseq=$cseq sdp=$sdp")
+
+        fun sdpElement(command: String): String? {
+            val v = sdp.firstOrNull { it.startsWith("$command=") } ?: return null
+            return v.substring(2)
+        }
+
+        val sdpConnectionData = sdpElement("c") ?: return 488
+        val sdpMedia = sdpElement("m") ?: return 488
+        val rtpRemote = sdpConnectionData.split(" ").getOrNull(2) ?: return 488
+        val rtpRemoteAddr = InetAddress.getByName(rtpRemote)
+        val rtpRemotePort = sdpMedia.split(" ").getOrNull(1)?.toIntOrNull() ?: return 488
+        val attributes = sdp.filter { it.startsWith("a=") }.map { it.substring(2) }
+
+        fun lookTrackMatching(codec: String, notAdditional: String = ""): Pair<Int, String>? {
+            val maps = attributes.filter { it.startsWith("rtpmap") && it.contains(codec) }
+            val matches = maps.map { m ->
+                val track = m.split("[: ]+".toRegex())[1].toInt()
+                Pair(track, m)
+            }
+            val sorted = if (matches.size > 1) {
+                matches.sortedBy { m ->
+                    val fmtp = attributes.firstOrNull { it.startsWith("fmtp:${m.first}") }.orEmpty()
+                    when {
+                        codec.startsWith("AMR") && fmtp.isEmpty() -> 100
+                        notAdditional.isNotEmpty() && fmtp.contains(notAdditional) -> 90
+                        else -> 10
+                    }
+                }
+            } else {
+                matches
+            }
+            Rlog.d(TAG, "In-dialog INVITE matching $codec, got $sorted")
+            return sorted.firstOrNull()
+        }
+
+        fun trackRequirements(track: Int): String? {
+            return attributes.firstOrNull { it.startsWith("fmtp:$track") }
+        }
+
+        val (amrTrack, amrTrackDesc) =
+            lookTrackMatching("AMR/8000", notAdditional = "octet-align=1") ?: return 488
+        val (dtmfTrack, dtmfTrackDesc) =
+            lookTrackMatching("telephone-event/8000") ?: return 488
+        val amrFmtpAnswer =
+            trackRequirements(amrTrack) ?: "fmtp:$amrTrack mode-set=7;octet-align=0;max-red=0"
+        val remoteMaxptime = attributes.firstOrNull { it.startsWith("maxptime:") } ?: "maxptime:20"
+        val allTracks = listOf(amrTrack, dtmfTrack).sorted()
+        val owner = request.destination.substringAfter("sip:").substringBefore("@")
+        val ipType = if (socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
+        val answerSdp = listOf(
+            "v=0",
+            "o=$owner 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}",
+            "s=phh voice call",
+            "c=IN $ipType ${socket.gLocalAddr().hostAddress}",
+            "b=AS:38",
+            "b=RS:0",
+            "b=RR:0",
+            "t=0 0",
+            "m=audio ${call.rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}",
+            "b=AS:38",
+            "b=RS:0",
+            "b=RR:0",
+            "a=$amrTrackDesc",
+            "a=ptime:20",
+            "a=$remoteMaxptime",
+            "a=$dtmfTrackDesc",
+            "a=$amrFmtpAnswer",
+            "a=fmtp:$dtmfTrack 0-15",
+            "a=sendrecv",
+        ).joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+
+        currentCall = call.copy(
+            amrTrack = amrTrack,
+            amrTrackDesc = amrTrackDesc,
+            dtmfTrack = dtmfTrack,
+            dtmfTrackDesc = dtmfTrackDesc,
+            sdp = answerSdp,
+            rtpRemoteAddr = rtpRemoteAddr,
+            rtpRemotePort = rtpRemotePort,
+            remoteContact = request.headers["contact"]?.getOrNull(0)
+                ?.let { extractDestinationFromContact(it) }
+                ?: call.remoteContact,
+        )
+
+        val responseHeaders = responseHeadersFromRequest(
+            request,
+            extra = """
+                Contact: ${call.callHeaders["contact"]!!.first()}
+                Supported: replaces, timer
+                Content-Type: application/sdp
+                Session-Expires: 1800;refresher=uas
+            """.toSipHeadersMap()
+        )
+        val response = SipResponse(
+            statusCode = 200,
+            statusString = "OK",
+            headersParam = responseHeaders,
+            body = answerSdp,
+        )
+        Rlog.d(TAG, "Replying to in-dialog INVITE without creating a new incoming call: $response")
+        synchronized(responseWriter) { responseWriter.write(response.toByteArray()) }
+        return 0
+    }
+
     fun handleCall(request: SipRequest): Int {
         val contentType = request.headers["content-type"]?.get(0)
         if (contentType != "application/sdp") return 404
+        val incomingCallId = request.headers["call-id"]!![0]
+        val incomingResponseWriter = requestWriters[incomingCallId] ?: socket.gWriter()
+        val existingCall = currentCall
+        val isInDialogInvite = existingCall != null &&
+            existingCall.callHeaders["call-id"]?.getOrNull(0) == incomingCallId &&
+            request.headers["from"]?.any { it.contains(";tag=", ignoreCase = true) } == true &&
+            request.headers["to"]?.any { it.contains(";tag=", ignoreCase = true) } == true
+        if (isInDialogInvite) {
+            return handleInDialogInvite(request, existingCall!!, incomingResponseWriter)
+        }
+
         callStopped.set(false)
         callStarted.set(false)
         threadsStarted.set(false)
@@ -2050,8 +2173,6 @@ a=sendrecv
         val f = request.headers["from"]
         val r = Regex(".*(sip|tel):([^@]*).*")
         val m = r.find(f!![0]!!)!!.groups[2]!!.value
-        val incomingCallId = request.headers["call-id"]!![0]
-        val incomingResponseWriter = requestWriters[incomingCallId] ?: socket.gWriter()
         Rlog.d(TAG, "Incoming call from $m callId=$incomingCallId hasIncomingResponseWriter=${requestWriters.containsKey(incomingCallId)}")
 
         // We'll have three states:
