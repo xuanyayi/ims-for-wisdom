@@ -2084,11 +2084,76 @@ a=sendrecv
         }
     }
 
+    fun sendDtmf(c: Char, durationMs: Int = 160) {
+        val call = currentCall
+        if (call == null) {
+            Rlog.w(TAG, "sendDtmf without current call")
+            return
+        }
+        val event = when (c.uppercaseChar()) {
+            '0','1','2','3','4','5','6','7','8','9' -> c.digitToInt()
+            '*' -> 10
+            '#' -> 11
+            'A' -> 12
+            'B' -> 13
+            'C' -> 14
+            'D' -> 15
+            else -> {
+                Rlog.w(TAG, "Ignoring unsupported DTMF char: $c")
+                return
+            }
+        }
+
+        thread {
+            try {
+                // RFC 4733 telephone-event. Keep one RTP timestamp for the whole event,
+                // increase duration, and repeat the final packet with the E bit set.
+                val timestamp = (System.nanoTime() / 125000L).toInt()
+                val durationSamples = durationMs.coerceAtLeast(80) * 8
+                val steps = listOf(
+                    durationSamples / 4,
+                    durationSamples / 2,
+                    durationSamples,
+                    durationSamples,
+                    durationSamples,
+                    durationSamples,
+                )
+                Rlog.d(TAG, "Sending RTP DTMF event=$event char=$c payload=${call.dtmfTrack} durationMs=$durationMs remote=${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                for ((index, duration) in steps.withIndex()) {
+                    val sendCall = currentCall ?: return@thread
+                    val sequenceNumber = rtpSequenceNumber.getAndIncrement()
+                    val marker = if (index == 0) 0x80 else 0x00
+                    val end = if (index >= 3) 0x80 else 0x00
+                    val volume = 10
+                    val rtpHeader = byteArrayOf(
+                        0x80.toByte(),
+                        (marker or sendCall.dtmfTrack).toByte(),
+                        (sequenceNumber shr 8).toByte(), (sequenceNumber and 0xff).toByte(),
+                        (timestamp shr 24).toByte(), ((timestamp shr 16) and 0xff).toByte(),
+                        ((timestamp shr 8) and 0xff).toByte(), (timestamp and 0xff).toByte(),
+                        0x03, 0x00, 0xd2.toByte(), 0x00,
+                    )
+                    val payload = byteArrayOf(
+                        event.toByte(),
+                        (end or volume).toByte(),
+                        (duration shr 8).toByte(), (duration and 0xff).toByte(),
+                    )
+                    val buf = rtpHeader + payload
+                    sendCall.rtpSocket.send(DatagramPacket(buf, buf.size, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort))
+                    Thread.sleep(20)
+                }
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "Failed to send RTP DTMF char=$c", t)
+            }
+        }
+    }
+
     val callStopped = AtomicBoolean(false)
     val callStarted = AtomicBoolean(false)
     val updateReceived = AtomicBoolean(false)
     val threadsStarted = AtomicBoolean(false)
     val callGeneration = AtomicInteger(0)
+    private val rtpSequenceNumber = AtomicInteger(0)
 
     val prAckWaitLock = Object()
     var prAckWait = mutableSetOf<Int>()

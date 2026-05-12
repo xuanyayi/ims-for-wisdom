@@ -118,6 +118,18 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 Rlog.d(TAG, "Rejecting call with reason $reason")
             }
 
+            override fun sendDtmf(c: Char, result: Message?) {
+                Rlog.d(TAG, "Sending outgoing DTMF $c")
+                sipHandler.sendDtmf(c)
+                result?.sendToTarget()
+            }
+            override fun startDtmf(c: Char) {
+                Rlog.d(TAG, "Starting outgoing DTMF $c")
+                sipHandler.sendDtmf(c)
+            }
+            override fun stopDtmf() {
+                Rlog.d(TAG, "Stopping outgoing DTMF")
+            }
             override fun terminate(reason: Int) {
                 Rlog.d(TAG, "Terminating call with reason $reason")
                 sipHandler.myHandler.post {
@@ -262,6 +274,21 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 override fun reject(reason: Int) {
                     sipHandler.rejectCall()
                     Rlog.d(TAG, "Rejecting call $reason")
+                }
+
+                override fun sendDtmf(c: Char, result: Message?) {
+                    Rlog.d(TAG, "Sending incoming-call DTMF $c")
+                    sipHandler.sendDtmf(c)
+                    result?.sendToTarget()
+                }
+
+                override fun startDtmf(c: Char) {
+                    Rlog.d(TAG, "Starting incoming-call DTMF $c")
+                    sipHandler.sendDtmf(c)
+                }
+
+                override fun stopDtmf() {
+                    Rlog.d(TAG, "Stopping incoming-call DTMF")
                 }
 
                 override fun terminate(reason: Int) {
