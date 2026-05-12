@@ -1033,21 +1033,7 @@ a=des:qos mandatory remote sendrecv
 a=sendrecv
                        """.trim().toByteArray()
 
-        currentCall = Call(
-            outgoing =  call.outgoing,
-            amrTrack = call.amrTrack,
-            amrTrackDesc = call.amrTrackDesc,
-            dtmfTrack = call.dtmfTrack,
-            dtmfTrackDesc = call.dtmfTrackDesc,
-            callHeaders = call.callHeaders,
-            rtpRemoteAddr = call.rtpRemoteAddr,
-            rtpRemotePort = call.rtpRemotePort,
-            rtpSocket = call.rtpSocket,
-            sdp = request.body,
-            hasEarlyMedia = call.hasEarlyMedia,
-            remoteContact = call.remoteContact,
-            incomingResponseWriter = call.incomingResponseWriter,
-            )
+        currentCall = call.copy(sdp = request.body)
 
         val reply =
             SipResponse(
@@ -1167,6 +1153,7 @@ a=sendrecv
         val remoteContact: String,
         val incomingResponseWriter: OutputStream? = null,
         val localCseq: AtomicInteger = AtomicInteger(2),
+        val localSdpVersion: AtomicInteger = AtomicInteger(2),
     )
 
     private data class AmrNbFrame(
@@ -1914,21 +1901,42 @@ a=sendrecv
                             callEncodeThread()
                         }
 
-                        val newSdp = respSdp.map { line ->
-                            if (line.startsWith("a=curr:qos local")) {
-                                "a=curr:qos local sendrecv"
-                            } else if (line.startsWith("a=des:qos mandatory local")) {
-                                "a=des:qos mandatory local sendrecv"
-                            } else {
-                                line
+                        val remoteMaxptimeLine = respSdp.firstOrNull { it.startsWith("a=maxptime:") } ?: "a=maxptime:40"
+
+                        val localUpdateSdpLines = sdp.toString(Charsets.UTF_8)
+                            .split("[\r\n]+".toRegex())
+                            .filter { it.isNotBlank() }
+                            .map { line ->
+                                when {
+                                    line.startsWith("o=") -> {
+                                        val v = currentCall?.localSdpVersion?.incrementAndGet() ?: 3
+                                        line.replace(Regex("^(o=\\S+\\s+\\S+\\s+)\\S+(\\s+IN\\s+IP[46]\\s+.*)$"), "$1$v$2")
+                                    }
+                                    line.startsWith("a=maxptime:") -> remoteMaxptimeLine
+                                    line.startsWith("a=curr:qos local") -> "a=curr:qos local sendrecv"
+                                    line.startsWith("a=curr:qos remote") -> "a=curr:qos remote none"
+                                    else -> line
+                                }
                             }
-                        }.joinToString("\r\n").toByteArray()
+                            .let { lines ->
+                                if (lines.any { it.startsWith("a=conf:qos remote") }) {
+                                    lines
+                                } else {
+                                    lines + "a=conf:qos remote sendrecv"
+                                }
+                            }
+
+                        val newSdp = localUpdateSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+
+                        val updateHeaders = localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE) -
+                            "content-length" +
+                            ("content-type" to listOf("application/sdp"))
 
                         val msg2 =
                             SipRequest(
                                 SipMethod.UPDATE,
-                                to,
-                                currentCall!!.callHeaders + ("content-type" to listOf("application/sdp")),
+                                currentCall!!.remoteContact ?: to,
+                                updateHeaders,
                                 newSdp
                             )
                         Rlog.d(TAG, "Sending $msg2")
