@@ -966,7 +966,15 @@ class SipHandler(val ctxt: Context) {
             // single-route O2/S9 case we can use it directly as Route for local in-dialog requests.
             mapOf("route" to rr)
         } ?: emptyMap()
-        return base + directionHeaders + routeSet + mapOf("call-id" to call.callHeaders["call-id"]!!) +
+        val securityHeaders = commonHeaders["security-verify"]?.let { securityVerify ->
+            // This stack registers with sec-agree/IPsec. Some P-CSCFs also require the
+            // negotiated Security-Verify header on later in-dialog requests such as UPDATE.
+            mapOf(
+                "security-verify" to securityVerify,
+                "require" to listOf("sec-agree"),
+            )
+        } ?: emptyMap()
+        return base + directionHeaders + routeSet + securityHeaders + mapOf("call-id" to call.callHeaders["call-id"]!!) +
             """
             Contact: $contact
             CSeq: $cseq $method
@@ -1795,10 +1803,21 @@ a=sendrecv
                 } else {
                     Rlog.d(TAG, "Invite got status ${resp.statusCode} = ${resp.statusString}")
                     if(resp.statusCode >= 400) {
+                        val failedCallId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                        val failedCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
+                        Rlog.w(TAG, "Outgoing dialog request failed: status=${resp.statusCode} ${resp.statusString} cseq=$failedCseq callId=$failedCallId")
+                        callStopped.set(true)
+                        callStarted.set(false)
+                        threadsStarted.set(false)
+                        val activeCallId = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
+                        if (activeCallId == failedCallId) {
+                            currentCall = null
+                        }
                         onCancelledCall?.invoke(Object(), "",
                             mapOf(
                                 "statusCode" to resp.statusCode.toString(),
-                                "statusString" to resp.statusString))
+                                "statusString" to resp.statusString,
+                                "cseq" to failedCseq))
                         // The whole call failed, so drop that call-id
                         return@setResponseCallback true
                     }
