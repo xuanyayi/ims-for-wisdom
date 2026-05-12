@@ -1800,7 +1800,15 @@ a=des:qos optional remote sendrecv
 a=sendrecv
                        """.trim().toByteArray()
 
-            val to = "tel:$phoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
+            val normalizedPhoneNumber = PhoneNumberUtils.stripSeparators(phoneNumber).trim()
+            val to = if (normalizedPhoneNumber.startsWith("+")) {
+                // Global TEL URIs must stand on their own. Adding phone-context to +E.164
+                // numbers makes some IMS cores drop the INVITE without any SIP response.
+                "tel:$normalizedPhoneNumber"
+            } else {
+                "tel:$normalizedPhoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
+            }
+            Rlog.d(TAG, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
             val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
             val local =
                 if(socket.gLocalAddr() is Inet6Address)
