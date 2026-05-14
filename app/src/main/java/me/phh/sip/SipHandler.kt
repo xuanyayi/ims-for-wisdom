@@ -1392,7 +1392,7 @@ a=sendrecv
         clearPendingOutgoingInvite(callId, closeRtpSocket = false, reason = "remote ${request.method}")
         val cancelExtras = if (isBye && terminatedCall?.outgoing == true && terminatedCall.outgoingConnectedNotified.get() == false) {
             Rlog.w(TAG, "Remote ended outgoing call before any RTP/media arrived; reporting as network rejection callId=$callId")
-            mapOf("call-id" to callId, "statusCode" to "480", "statusString" to "No post-answer RTP before BYE")
+            mapOf("call-id" to callId, "statusCode" to "480", "statusString" to "No post-answer RTP before BYE", "remoteNoMediaRelease" to "true")
         } else {
             mapOf("call-id" to callId)
         }
@@ -1716,6 +1716,7 @@ a=sendrecv
                         "call-id" to callId,
                         "statusCode" to "480",
                         "statusString" to "No post-answer RTP",
+                        "remoteNoMediaRelease" to "true",
                     )
                 )
             } catch (t: Throwable) {

@@ -317,8 +317,12 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
     val statusCode = map["statusCode"]?.toInt() ?: -1
             val statusMessage = map["statusString"] ?: "Kikoo"
             val localReject = map["localReject"] == "true"
+            val remoteNoMediaRelease = map["remoteNoMediaRelease"] == "true"
             val reasonInfo = if (localReject) {
                 ImsReasonInfo(ImsReasonInfo.CODE_USER_DECLINE, 0, statusMessage)
+            } else if (remoteNoMediaRelease) {
+                Rlog.w(TAG, "No-media outgoing release; reporting as remote termination for Dialer UX: $statusMessage")
+                ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE, 0, statusMessage)
             } else if (statusCode >= 400) {
                 ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage)
             } else {
