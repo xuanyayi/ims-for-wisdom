@@ -272,7 +272,10 @@ class SipHandler(val ctxt: Context) {
                     }
             )
         Rlog.d(TAG, "Replying back with $reply")
-        synchronized(writer) { writer.write(reply.toByteArray()) }
+        synchronized(writer) {
+            writer.write(reply.toByteArray())
+            writer.flush()
+        }
 
         return true
     }
@@ -897,7 +900,10 @@ class SipHandler(val ctxt: Context) {
                     """.toSipHeadersMap()
             ) // route present on all calls except this
         Rlog.d(TAG, "Sending $msg")
-        synchronized(writer) { writer.write(msg.toByteArray()) }
+        synchronized(writer) {
+            writer.write(msg.toByteArray())
+            writer.flush()
+        }
         registerCounter += 1
     }
 
@@ -1644,8 +1650,8 @@ a=sendrecv
                 "Content-Length: 0".toSipHeadersMap()
             val msg =
                 SipResponse(
-                    statusCode = 603,
-                    statusString = "Decline",
+                    statusCode = 486,
+                    statusString = "Busy Here",
                     headersParam = myHeaders,
                     autofill = false
                 )
