@@ -124,7 +124,7 @@ internal class SipDispatcher(
         return true
     }
 
-    private fun handleResponse(response: SipResponse): Boolean {
+    fun handleResponse(response: SipResponse): Boolean {
         val callId = response.headers["call-id"]?.get(0)
         if (callId == null) {
             // Message without call-id should never happen, close connection.

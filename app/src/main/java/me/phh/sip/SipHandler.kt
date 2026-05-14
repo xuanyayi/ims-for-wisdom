@@ -118,6 +118,7 @@ class SipHandler(val ctxt: Context) {
     private val incomingFinalResponseSent = AtomicBoolean(false)
     private val incomingAcceptedAwaitingAck = AtomicBoolean(false)
     private val incomingHangupAfterAck = AtomicBoolean(false)
+    private val dispatcher = SipDispatcher(TAG)
 
     private val cbLock = ReentrantLock()
     private var requestCallbacks: Map<SipMethod, ((SipRequest) -> Int)> = mapOf()
@@ -172,95 +173,19 @@ class SipHandler(val ctxt: Context) {
     }
 
     fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
-        cbLock.withLock { requestCallbacks += (method to cb) }
+        dispatcher.setRequestCallback(method, cb)
     }
+
     fun setResponseCallback(callId: String, cb: (SipResponse) -> Boolean) {
-        cbLock.withLock { responseCallbacks += (callId to cb) }
+        dispatcher.setResponseCallback(callId, cb)
     }
 
     fun parseMessage(reader: SipReader, writer: OutputStream): Boolean {
-        val msg =
-            try {
-                reader.parseMessage()
-            } catch (e: SocketException) {
-                Rlog.d(TAG, "Got exception $e")
-                if ("$e" == "java.net.SocketException: Try again") {
-                    // we sometimes seem to get EAGAIN
-                    return true
-                }
-                throw e
-            }
-        Rlog.d(TAG, "RObject() message $msg")
-        if (msg is SipResponse) {
-            return handleResponse(msg)
-        }
-        if (msg !is SipRequest) {
-            // invalid message, stop trying
-            Rlog.d(TAG, "Got invalid message! Closing socket (except main)")
-            return false
-        }
-
-        msg.headers["call-id"]?.getOrNull(0)?.let { callId ->
-            requestWriters[callId] = writer
-        }
-
-        val requestCb = cbLock.withLock { requestCallbacks[msg.method] }
-        var status = 200
-        // XXX default requestCb = notification?
-        if (requestCb != null) {
-            status = try {
-                requestCb(msg)
-            } catch (t: Throwable) {
-                Rlog.e(TAG, "Request handler for ${msg.method} crashed; replying 500 and keeping SIP transport alive", t)
-                500
-            }
-        }
-        if(status == 0) return true
-        val reply =
-            SipResponse(
-                statusCode = status,
-                statusString = when (status) {
-                    100 -> "Trying"
-                    200 -> "OK"
-                    481 -> "Call/Transaction Does Not Exist"
-                    486 -> "Busy Here"
-                    487 -> "Request Terminated"
-                    488 -> "Not Acceptable Here"
-                    500 -> "Server Internal Error"
-                    603 -> "Decline"
-                    else -> "ERROR"
-                },
-                headersParam =
-                    msg.headers.filter { (k, _) ->
-                        k in listOf("cseq", "via", "from", "to", "call-id")
-                    }
-            )
-        Rlog.d(TAG, "Replying back with $reply")
-        synchronized(writer) {
-            writer.write(reply.toByteArray())
-            writer.flush()
-        }
-
-        return true
+        return dispatcher.parseMessage(reader, writer)
     }
 
     fun handleResponse(response: SipResponse): Boolean {
-        val callId = response.headers["call-id"]?.get(0)
-        if (callId == null) {
-            // message without call-id should never happen, close connection
-            return false
-        }
-        val responseCb = cbLock.withLock { responseCallbacks[callId] }
-        if (responseCb == null) {
-            // nothing to do
-            return true
-        }
-
-        if (responseCb(response)) {
-            // remove callback if done
-            cbLock.withLock { responseCallbacks -= callId }
-        }
-        return true
+        return dispatcher.handleResponse(response)
     }
 
     fun getRegistrationTech(): Int = imsRegistrationTech
@@ -340,11 +265,8 @@ class SipHandler(val ctxt: Context) {
             prAckWait.clear()
             prAckWaitLock.notifyAll()
         }
-        cbLock.withLock {
-            requestCallbacks = mapOf()
-            responseCallbacks = mapOf()
-        }
-        requestWriters.clear()
+        dispatcher.clearCallbacks()
+        dispatcher.clearWriters()
         smsLock.withLock { smsHeadersMap.clear() }
     }
 
@@ -1210,7 +1132,7 @@ a=sendrecv
             )
         Rlog.d(TAG, "Replying back with $reply")
         val updateCallId = request.headers["call-id"]?.getOrNull(0)
-        val updateResponseWriter = updateCallId?.let { requestWriters[it] } ?: socket.gWriter()
+        val updateResponseWriter = updateCallId?.let { dispatcher.writerForCallId(it) } ?: socket.gWriter()
         synchronized(updateResponseWriter) { updateResponseWriter.write(reply.toByteArray()) }
 
         if(call?.outgoing == false) {
@@ -1250,7 +1172,7 @@ a=sendrecv
                 autofill = false
             )
             Rlog.d(TAG, "Sending explicit 200 OK to late CANCEL: $response")
-            val cancelResponseWriter = requestWriters[callId] ?: currentCall?.incomingResponseWriter ?: socket.gWriter()
+            val cancelResponseWriter = dispatcher.writerForCallId(callId) ?: currentCall?.incomingResponseWriter ?: socket.gWriter()
             synchronized(cancelResponseWriter) { cancelResponseWriter.write(response.toByteArray()) }
 
             callStopped.set(true)
@@ -1274,7 +1196,7 @@ a=sendrecv
         Rlog.d(TAG, "Cancelled call $callId method=${request.method}")
 
         if (isCancel) {
-            val cancelResponseWriter = currentCall?.incomingResponseWriter ?: requestWriters[callId] ?: socket.gWriter()
+            val cancelResponseWriter = currentCall?.incomingResponseWriter ?: dispatcher.writerForCallId(callId) ?: socket.gWriter()
             val toOverride = currentCall?.callHeaders?.get("to") ?: request.headers["to"]
 
             // RFC 3261: CANCEL is its own transaction. Reply 200 OK to the CANCEL,
@@ -1702,7 +1624,7 @@ a=sendrecv
                     headersParam = myHeaders,
                     autofill = false
                 )
-            val responseWriter = call.incomingResponseWriter ?: requestWriters[rejectedCallId] ?: socket.gWriter()
+            val responseWriter = call.incomingResponseWriter ?: dispatcher.writerForCallId(rejectedCallId) ?: socket.gWriter()
             Rlog.d(TAG, "Sending $msg via incomingResponseWriter=${call.incomingResponseWriter != null}")
             synchronized(responseWriter) { responseWriter.write(msg.toByteArray()) }
 
@@ -2582,7 +2504,7 @@ a=sendrecv
         val contentType = request.headers["content-type"]?.get(0)
         if (contentType != "application/sdp") return 404
         val incomingCallId = request.headers["call-id"]!![0]
-        val incomingResponseWriter = requestWriters[incomingCallId] ?: socket.gWriter()
+        val incomingResponseWriter = dispatcher.writerForCallId(incomingCallId) ?: socket.gWriter()
         val existingCall = currentCall
         val isInDialogInvite = existingCall != null &&
             existingCall.callHeaders["call-id"]?.getOrNull(0) == incomingCallId &&
