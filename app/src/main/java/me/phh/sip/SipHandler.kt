@@ -186,6 +186,8 @@ class SipHandler(val ctxt: Context) {
     // 180/200 to the registration/control socket can make the P-CSCF ignore the final response.
     private val requestWriters = java.util.concurrent.ConcurrentHashMap<String, OutputStream>()
     private val reconnecting = AtomicBoolean(false)
+    private val reconnectRetryScheduled = AtomicBoolean(false)
+    private val imsConnectFailureCount = AtomicInteger(0)
     private var imsReady = false
     var imsReadyCallback: (() -> Unit)? = null
     var imsFailureCallback: (() -> Unit)? = null
@@ -385,6 +387,44 @@ class SipHandler(val ctxt: Context) {
         resetRegistrationStateForConnect()
     }
 
+    private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
+        val retryNetwork = if (this::network.isInitialized) network else null
+        if (retryNetwork == null) {
+            Rlog.w(TAG, "Cannot schedule IMS reconnect retry without a Network: $reason")
+            return
+        }
+
+        if (!reconnectRetryScheduled.compareAndSet(false, true)) {
+            Rlog.w(TAG, "IMS reconnect retry already scheduled, ignore: $reason")
+            return
+        }
+
+        thread {
+            try {
+                Rlog.w(TAG, "IMS reconnect retry in ${delayMs}ms: $reason")
+                Thread.sleep(delayMs)
+
+                // Clear before reconnectIms(), so a failed retry may schedule the next
+                // backoff attempt.
+                reconnectRetryScheduled.set(false)
+                reconnectIms("retry after failed SIP connect: $reason", retryNetwork, delayMs = 0L)
+            } catch (t: Throwable) {
+                Rlog.e(TAG, "IMS reconnect retry failed to start: $reason", t)
+            } finally {
+                reconnectRetryScheduled.set(false)
+            }
+        }
+    }
+
+    private fun failConnectAndRetry(reason: String, baseDelayMs: Long = 5000L) {
+        val failures = imsConnectFailureCount.incrementAndGet().coerceAtMost(6)
+        val delayMs = (baseDelayMs * (1L shl (failures - 1))).coerceAtMost(120_000L)
+
+        Rlog.w(TAG, "$reason; reporting deregistered and retrying IMS registration in ${delayMs}ms")
+        imsFailureCallback?.invoke()
+        scheduleReconnectRetry(reason, delayMs)
+    }
+
     private fun reconnectIms(reason: String, newNetwork: Network? = null, delayMs: Long = 1000L) {
         if (!reconnecting.compareAndSet(false, true)) {
             Rlog.w(TAG, "IMS reconnect already running, ignore: $reason")
@@ -404,7 +444,7 @@ class SipHandler(val ctxt: Context) {
                 connect()
             } catch (t: Throwable) {
                 Rlog.e(TAG, "IMS reconnect failed: $reason", t)
-                imsFailureCallback?.invoke()
+                failConnectAndRetry("IMS reconnect failed: $reason")
             } finally {
                 reconnecting.set(false)
             }
@@ -421,7 +461,7 @@ class SipHandler(val ctxt: Context) {
         Rlog.d(TAG, "Got link properties $lp")
         if (lp == null) {
             Rlog.w(TAG, "No link properties for IMS network")
-            imsFailureCallback?.invoke()
+            failConnectAndRetry("No link properties for IMS network")
             return
         }
         imsRegistrationTech = detectRegistrationTech(lp)
@@ -454,7 +494,7 @@ class SipHandler(val ctxt: Context) {
         val newLocalAddr = getImsLocalAddress(lp)
         if (newLocalAddr == null) {
             Rlog.w(TAG, "No usable local address on IMS link properties")
-            imsFailureCallback?.invoke()
+            failConnectAndRetry("No usable local address on IMS link properties")
             return
         }
         localAddr = newLocalAddr
@@ -500,7 +540,7 @@ class SipHandler(val ctxt: Context) {
         plainSocket.close()
         if (plainRegReply !is SipResponse || plainRegReply.statusCode != 401) {
             Rlog.w(TAG, "Didn't get expected response from initial register, aborting")
-            imsFailureCallback?.invoke()
+            failConnectAndRetry("Initial SIP REGISTER did not return 401")
             return
         }
 
@@ -604,9 +644,11 @@ class SipHandler(val ctxt: Context) {
 
         if (regReply !is SipResponse || regReply.statusCode != 200) {
             Rlog.w(TAG, "Could not connect, aborting SIP")
-            imsFailureCallback?.invoke()
+            failConnectAndRetry("Authenticated SIP REGISTER did not return 200")
             return
         }
+
+        imsConnectFailureCount.set(0)
 
         setResponseCallback(registerHeaders["call-id"]!![0], ::registerCallback)
         setRequestCallback(SipMethod.MESSAGE, ::handleSms)
@@ -753,7 +795,8 @@ class SipHandler(val ctxt: Context) {
                             try {
                                 connect()
                             } catch (e: Throwable) {
-                                Rlog.e(TAG, "connect() failed: $e")
+                                Rlog.e(TAG, "connect() failed from IMS network callback", e)
+                        failConnectAndRetry("connect() failed from IMS network callback")
                             }
                         }
                     } else if (abandonnedBecauseOfNoPcscf || network != _network) {
@@ -935,6 +978,7 @@ class SipHandler(val ctxt: Context) {
         }*/
         imsReadyCallback?.invoke()
         imsReady = true
+        imsConnectFailureCount.set(0)
         return true
     }
 
