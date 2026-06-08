@@ -1514,7 +1514,10 @@ a=sendrecv
 
 
     @SuppressLint("MissingPermission")
-    fun callEncodeThread() {
+    fun callEncodeThread(
+        incomingMicStartDelayMs: Long = 0L,
+        reason: String = "default",
+    ) {
         val call = currentCall!!
         val gen = callGeneration.get()
         thread {
@@ -1563,6 +1566,70 @@ a=sendrecv
                 sequenceNumber++
             }
             Rlog.d(TAG, "Silence loop exited after $sequenceNumber packets, starting real encoding")
+            if (!call.outgoing && incomingMicStartDelayMs > 0L) {
+                val settleDeadline = System.currentTimeMillis() + incomingMicStartDelayMs
+                var settlePackets = 0
+                Rlog.d(
+                    TAG,
+                    "Delaying incoming AudioRecord start by ${incomingMicStartDelayMs}ms after ACK: reason=$reason gen=$gen",
+                )
+                while (System.currentTimeMillis() < settleDeadline) {
+                    if (callStopped.get() || callGeneration.get() != gen) {
+                        Rlog.d(
+                            TAG,
+                            "Incoming mic delay exiting early: callStopped=${callStopped.get()} genMismatch=${callGeneration.get() != gen}",
+                        )
+                        try {
+                            encoder.stop()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            encoder.release()
+                        } catch (_: Throwable) {
+                        }
+                        return@thread
+                    }
+            
+                    val timestamp = sequenceNumber * 160
+                    val sendCall = currentCall ?: call
+                    val rtpHeader = listOf(
+                        0x80,
+                        sendCall.amrTrack,
+                        sequenceNumber shr 8,
+                        sequenceNumber and 0xff,
+                        timestamp shr 24,
+                        (timestamp shr 16) and 0xff,
+                        (timestamp shr 8) and 0xff,
+                        timestamp and 0xff,
+                        0x03,
+                        0x00,
+                        0xd2,
+                        0x00,
+                    )
+                    val amrNothing = listOf(0x77, 0xc0)
+                    val buf = (rtpHeader + amrNothing).map { it.toByte() }.toByteArray()
+                    try {
+                        if (!sendRtpPacket(sendCall.rtpSocket, buf, sendCall.rtpRemoteAddr, sendCall.rtpRemotePort, "incoming RTP settle silence #$sequenceNumber")) {
+                            throw IOException("RTP send failed")
+                        }
+                    } catch (e: Exception) {
+                        Rlog.w(TAG, "Incoming RTP settle silence failed, stopping encode thread: ${e.message}", e)
+                        try {
+                            encoder.stop()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            encoder.release()
+                        } catch (_: Throwable) {
+                        }
+                        return@thread
+                    }
+                    sequenceNumber++
+                    settlePackets++
+                    Thread.sleep(20)
+                }
+                Rlog.d(TAG, "Incoming AudioRecord delay complete after $settlePackets packets; starting real encoding")
+            }
 
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
@@ -1868,9 +1935,12 @@ a=sendrecv
             incomingAcceptedAwaitingAck.set(true)
             incomingHangupAfterAck.set(false)
             if (threadsStarted.compareAndSet(false, true)) {
-                Rlog.d(TAG, "Prewarming incoming media threads after final 200 OK while waiting for ACK")
+                Rlog.d(TAG, "Prewarming incoming media threads after final 200 OK while waiting for ACK; delaying mic open after ACK")
                 callDecodeThread()
-                callEncodeThread()
+                callEncodeThread(
+                    incomingMicStartDelayMs = 250L,
+                    reason = "incoming ACK audio route settle",
+                )
             } else {
                 Rlog.d(TAG, "Incoming media threads already started while accepting call")
             }
