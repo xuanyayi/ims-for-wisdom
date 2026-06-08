@@ -262,11 +262,12 @@ class SipHandler(
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val user = "$imsi@$realm"
+    private var registerTargetRealm = realm
     private var akaDigest = ""
+    private var registerSecurityClientOverride: String? = null
+    private var selectedSecurityClientForPromotedRegister: String? = null
     private fun initialRegisterAuthorization(): String =
         """Digest username="$user",realm="$realm",nonce="",uri="sip:$realm",response="",algorithm=AKAv1-MD5"""
-
-
     fun generateCallId(): SipHeadersMap = SipCallIdGenerator.generate()
 
     private var registerCounter = 1
@@ -647,6 +648,9 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         To: <sip:$user>
         """.toSipHeadersMap() + registerCallId
         commonHeaders = "".toSipHeadersMap()
+        registerTargetRealm = realm
+        registerSecurityClientOverride = null
+        selectedSecurityClientForPromotedRegister = null
         contact = ""
         mySip = ""
         myTel = ""
@@ -1162,10 +1166,35 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         plainSocket.close()
 
+        val registerDigestUriRealm = SipRegisterNegotiationPolicy.challengedRegistrarRealm(
+            defaultRealm = realm,
+            challengeRealm = registerChallenge.realm,
+        )
+        if (!registerDigestUriRealm.equals(realm, ignoreCase = true)) {
+            Rlog.w(
+                TAG,
+                "Using challenged REGISTER realm as request/digest URI: " +
+                    "oldUri=sip:$realm newUri=sip:$registerDigestUriRealm " +
+                    "challengeRealm=${registerChallenge.realm}",
+            )
+        }
+        registerTargetRealm = registerDigestUriRealm
+        registerSecurityClientOverride =
+            if (registerTargetRealm != realm) {
+                selectedSecurityClientForPromotedRegister?.also {
+                    Rlog.w(
+                        TAG,
+                        "Applying selected Security-Client for promoted REGISTER target: " +
+                            "defaultRealm=$realm targetRealm=$registerTargetRealm securityClient=$it",
+                    )
+                }
+            } else {
+                null
+            }
         akaDigest = SipRegistrationDigestFactory.create(
             user = user,
             realm = registerChallenge.realm,
-            uri = "sip:$realm",
+            uri = "sip:$registerDigestUriRealm",
             nonceB64 = registerChallenge.nonceB64,
             opaque = registerChallenge.opaque,
             akaResult = akaResult,
@@ -1179,6 +1208,19 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             commonHeaders += ("security-verify" to securityServer)
             registerHeaders += ("security-verify" to securityServer)
             val securityServerParams = SipSecurityServerSelector.select(securityServer).params
+                selectedSecurityClientForPromotedRegister =
+                    SipRegisterNegotiationPolicy.selectedSecurityClientHeader(
+                        securityServerParams = securityServerParams,
+                        ipsecSettings = ipsecSettings,
+                        clientPort = socket.gLocalPort(),
+                        serverPort = serverSocket.localPort,
+                    )
+
+
+            // Keep the protected REGISTER Security-Client identical to the initial
+            // Security-Client offer. Some IMS cores reject a narrowed/selected
+            // Security-Client as a bid-down attack.
+            registerSecurityClientOverride = null
 
             portS = securityServerParams["port-s"]!!.toInt()
             // spi string is 32 bit unsigned, but ipSecManager wants an int...
@@ -1581,6 +1623,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         registerHeaders += update.headers
         commonHeaders += update.headers
     }
+
+
+    private fun useSingTelNullSha1SecurityOffer(): Boolean =
+        realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
+            registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
+
     fun register(_writer: OutputStream? = null) {
         RegistrationCellInfoLogger.log(TAG, subTelephonyManager)
 
@@ -1594,7 +1642,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         val writer = _writer ?: socket.gWriter()
 
         val msg = SipRegisterRequestBuilder.build(
-            realm = realm,
+            realm = registerTargetRealm,
             registerHeaders = registerHeaders,
             registerCounter = registerCounter,
             contact = contact,
@@ -1602,6 +1650,12 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             ipsecSettings = ipsecSettings,
             clientPort = socket.gLocalPort(),
             serverPort = serverSocket.localPort,
+            securityClientOverride = registerSecurityClientOverride,
+            securityClientAlgs = if (useSingTelNullSha1SecurityOffer()) listOf("hmac-sha-1-96") else listOf("hmac-sha-1-96", "hmac-md5-96"),
+            securityClientEalgs = if (useSingTelNullSha1SecurityOffer()) listOf("null") else listOf("null", "aes-cbc"),
+            stripSecurityVerifyQ = false,
+            useSelectedSecurityClient = registerTargetRealm != realm,
+            forceSecurityAgreementNullEalg = false,
         )
         Rlog.d(TAG, "Sending $msg")
         synchronized(writer) {
