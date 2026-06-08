@@ -872,6 +872,88 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
 
+    private fun restartOutgoingMediaAfterDialogSdpCodecChange(
+        oldCall: Call?,
+        newCall: Call?,
+        reason: String,
+    ) {
+        if (oldCall == null || newCall == null || !newCall.outgoing) {
+            return
+        }
+
+        val codecChanged =
+            oldCall.audioCodec.name != newCall.audioCodec.name ||
+                oldCall.audioCodec.sampleRate != newCall.audioCodec.sampleRate ||
+                oldCall.amrTrack != newCall.amrTrack ||
+                oldCall.dtmfTrack != newCall.dtmfTrack
+
+        if (!codecChanged) {
+            return
+        }
+
+        val oldCallId = oldCall.callHeaders["call-id"]?.getOrNull(0)
+        val newCallId = newCall.callHeaders["call-id"]?.getOrNull(0)
+        if (oldCallId != newCallId) {
+            Rlog.d(
+                TAG,
+                "Ignoring outgoing dialog SDP codec change across call-id boundary: " +
+                    "reason=$reason oldCallId=$oldCallId newCallId=$newCallId",
+            )
+            return
+        }
+
+        if (!threadsStarted.get()) {
+            Rlog.d(
+                TAG,
+                "Outgoing dialog SDP changed codec before media start: reason=$reason " +
+                    "old=${oldCall.audioCodec.name}/${oldCall.audioCodec.sampleRate} pt=${oldCall.amrTrack} " +
+                    "new=${newCall.audioCodec.name}/${newCall.audioCodec.sampleRate} pt=${newCall.amrTrack}",
+            )
+            return
+        }
+
+        val newGeneration = callGeneration.incrementAndGet()
+        callStopped.set(true)
+        callStarted.set(false)
+        threadsStarted.set(false)
+
+        Rlog.w(
+            TAG,
+            "Restarting outgoing media after dialog SDP codec change: reason=$reason " +
+                "old=${oldCall.audioCodec.name}/${oldCall.audioCodec.sampleRate} pt=${oldCall.amrTrack}/${oldCall.dtmfTrack} " +
+                "new=${newCall.audioCodec.name}/${newCall.audioCodec.sampleRate} pt=${newCall.amrTrack}/${newCall.dtmfTrack} " +
+                "generation=$newGeneration",
+        )
+
+        myHandler.postDelayed({
+            val active = currentCall
+            val activeCallId = active?.callHeaders?.get("call-id")?.getOrNull(0)
+            if (active == null || activeCallId != newCallId || !active.outgoing) {
+                Rlog.w(
+                    TAG,
+                    "Skipping outgoing media restart after dialog SDP codec change; " +
+                        "activeCallId=$activeCallId expectedCallId=$newCallId activeOutgoing=${active?.outgoing}",
+                )
+                return@postDelayed
+            }
+
+            callStopped.set(false)
+            callStarted.set(false)
+            if (threadsStarted.compareAndSet(false, true)) {
+                Rlog.w(
+                    TAG,
+                    "Starting restarted outgoing media after dialog SDP codec change: " +
+                        "codec=${active.audioCodec.name}/${active.audioCodec.sampleRate} " +
+                        "pt=${active.amrTrack}/${active.dtmfTrack} generation=${callGeneration.get()}",
+                )
+                callDecodeThread()
+                callEncodeThread()
+            } else {
+                Rlog.w(TAG, "Outgoing media restart skipped; threads already restarted")
+            }
+        }, 150L)
+    }
+
     private fun hasActiveOrPendingCallForImsReconnectDeferral(): Boolean {
         val hasDialogState = currentCall != null || pendingOutgoingInvite != null
         if (hasDialogState) {
@@ -2171,6 +2253,8 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             while (true) {
                 if (callStopped.get() || callGeneration.get() != gen) break
                 val nRead = audioRecord.read(buffer, 0, buffer.size)
+                if (callStopped.get() || callGeneration.get() != gen) break
+                if (nRead <= 0) continue
                 if (realFrameCount < 5) {
                     val allZero = buffer.take(nRead.coerceAtLeast(0)).all { it == 0.toByte() }
                     Rlog.d(TAG, "AudioRecord.read nRead=$nRead allZero=$allZero (bufferSize=${buffer.size})")
@@ -3295,6 +3379,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     outgoingDialogNextCseq.get(),
                     currentCall?.localCseq?.get() ?: 0,
                 )
+                // PhhIms: final INVITE SDP media restart.
+                // Keep the media state selected by a provisional 183 before replacing
+                // currentCall with the later/final SDP answer. Some IMS cores answer
+                // 183 with AMR-NB and then switch the confirmed 200 OK to AMR-WB.
+                val previousOutgoingDialogCall = currentCall
                 currentCall = Call(
                     outgoing = true,
                     audioCodec = dialogAudioCodec,
@@ -3317,6 +3406,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     remoteContact = extractDestinationFromContact(resp.headers["contact"]!![0]),
                     localCseq = AtomicInteger(nextLocalCseqForDialog),
                 )
+                restartOutgoingMediaAfterDialogSdpCodecChange(
+                    previousOutgoingDialogCall,
+                    currentCall,
+                    "status=${resp.statusCode} cseq=${resp.headers["cseq"]?.getOrNull(0).orEmpty()}",
+                )
                 val responseCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
                 val outgoingDialogPhase = when {
                     responseCseq.contains("UPDATE") -> "update"
@@ -3333,6 +3427,30 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                         "route=${currentCall?.callHeaders?.get("route")}",
                 )
 
+                val outgoingMediaFormatChanged =
+                    threadsStarted.get() &&
+                        previousOutgoingDialogCall != null &&
+                        responseCseq.contains("INVITE") &&
+                        (resp.statusCode == 200 || resp.statusCode == 202) &&
+                        (
+                            previousOutgoingDialogCall.audioCodec != dialogAudioCodec ||
+                                previousOutgoingDialogCall.amrTrack != dialogAmrTrack ||
+                                previousOutgoingDialogCall.dtmfTrack != dialogDtmfTrack ||
+                                previousOutgoingDialogCall.rtpRemoteAddr != rtpRemoteAddr ||
+                                previousOutgoingDialogCall.rtpRemotePort != rtpRemotePortInt
+                        )
+                if (outgoingMediaFormatChanged) {
+                    Rlog.w(
+                        TAG,
+                        "Outgoing final INVITE SDP changed running media format: " +
+                            "oldCodec=${previousOutgoingDialogCall?.audioCodec?.name}/${previousOutgoingDialogCall?.audioCodec?.sampleRate} " +
+                            "oldAmr=${previousOutgoingDialogCall?.amrTrack} oldDtmf=${previousOutgoingDialogCall?.dtmfTrack} " +
+                            "oldRtp=${previousOutgoingDialogCall?.rtpRemoteAddr}:${previousOutgoingDialogCall?.rtpRemotePort} " +
+                            "newCodec=${dialogAudioCodec.name}/${dialogAudioCodec.sampleRate} " +
+                            "newAmr=$dialogAmrTrack newDtmf=$dialogDtmfTrack " +
+                            "newRtp=$rtpRemoteAddr:$rtpRemotePortInt",
+                    )
+                }
                 if (responseCseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
                     val finalInviteCallId = resp.callIdOrEmpty()
                     val finalInviteAfterLocalCancel = pendingOutgoingInvite?.callId == finalInviteCallId &&
@@ -3348,6 +3466,17 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                     clearPendingOutgoingInvite(finalInviteCallId, closeRtpSocket = false, reason = "final INVITE answer")
                     if (threadsStarted.compareAndSet(false, true)) {
                         Rlog.d(TAG, "Starting outgoing media threads from final INVITE SDP")
+                        callDecodeThread()
+                        callEncodeThread()
+                    } else if (outgoingMediaFormatChanged) {
+                        val mediaRestartGeneration = callGeneration.incrementAndGet()
+                        Rlog.w(
+                            TAG,
+                            "Restarting outgoing media threads after final INVITE SDP media change: " +
+                                "generation=$mediaRestartGeneration " +
+                                "codec=${dialogAudioCodec.name}/${dialogAudioCodec.sampleRate} " +
+                                "amrTrack=$dialogAmrTrack dtmfTrack=$dialogDtmfTrack",
+                        )
                         callDecodeThread()
                         callEncodeThread()
                     } else {
@@ -3546,6 +3675,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 Rlog.w(TAG, "Unexpected RTP receive failure; exiting decode thread", t)
                 break
             }
+            if (callStopped.get() || callGeneration.get() != gen) break
             receivedCount++
             if (receiveCall.outgoing) {
                 if (callStarted.get()) {
