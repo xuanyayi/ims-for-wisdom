@@ -1,17 +1,16 @@
-# PhhIms — VoLTE/VoWiFi for LineageOS on Samsung devices
+# PhhIms — VoLTE/VoWiFi for LineageOS on Samsung Exynos devices
 
 Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims) and the Samsung-focused fork history from [amikhasenko/ims](https://github.com/amikhasenko/ims).
 
-This fork is used as a userspace `ImsService`/MmTel provider for Samsung Exynos devices where the vendor IMS stack is missing, unusable, or not easily portable to current LineageOS releases.
+This fork is used as a privileged userspace `ImsService` / MmTel provider for Samsung Exynos devices where the vendor IMS stack is missing, unusable, or not practical to port to current LineageOS releases.
 
-The current work mainly targets Samsung Exynos LineageOS 23.x / Android 16 bring-up, with testing around:
+The current tested focus is Samsung Exynos LineageOS 23.x / Android 16 bring-up:
 
-- Samsung Galaxy A21s / Exynos850 (`a21s`, original bring-up target)
 - Samsung Galaxy S9 / S9+ / Note9 / Exynos9810 (`starlte`, `star2lte`, `crownlte`)
-- Samsung Galaxy S20 5G / Exynos9830 (`x1s`)
-- O2 Germany as the main known-good carrier test environment
+- Samsung Galaxy S20 / S20+ / S20 Ultra / Exynos9830 (`x1s`, `y2s`, `z3s` family; current testing mainly `x1s`)
+- O2 Germany / Telefónica Germany family as the main known-good carrier test environment
 
-This is not a drop-in universal IMS replacement. It depends on carrier provisioning, Samsung RIL behavior, device overlays, sepolicy, audio HAL behavior, and correct ROM-side integration.
+This is not a universal drop-in IMS replacement. It still depends on carrier provisioning, Samsung RIL behavior, correct Android telephony overlays, CarrierConfig, sepolicy, audio HAL behavior, and ROM-side integration.
 
 ## What this app does
 
@@ -22,10 +21,11 @@ At a high level it:
 - requests and tracks the IMS bearer network
 - reads P-CSCF information from `LinkProperties` or falls back to 3GPP DNS discovery
 - performs SIP AKA registration
-- reports IMS registration state back to Android telephony
-- handles VoLTE/VoWiFi voice calls with SIP and RTP
+- reports IMS registration state and capabilities back to Android telephony
+- handles VoLTE and VoWiFi voice calls with SIP and RTP
 - handles basic SMS over IMS
 - bridges incoming and outgoing SIP call state into Android `ImsCallSession` callbacks
+- avoids tearing down active calls during LTE/IWLAN tech-only handover events
 
 ## Current status
 
@@ -33,24 +33,26 @@ Status is based on the current Samsung LineageOS 23.x test branches. Expect carr
 
 | Area | Status |
 | --- | --- |
-| IMS registration | Working in current tests, including retry/reconnect handling after IMS bearer loss or failed REGISTER attempts. |
-| VoLTE outgoing calls | Working in tested configs, including Android call UI, SIP call setup, and two-way audio when ROM-side audio fixes are present. |
-| VoLTE incoming calls | Recently fixed/tested for accept and reject paths, but still the most sensitive area. Re-test after every dialog/call-state change. |
-| VoWiFi | Experimental. IWLAN/LTE transitions and stale IMS network handling need careful testing. |
-| SMS over IMS | Implemented and basically tested, but not as broadly validated as voice. |
+| IMS registration | Working in current Exynos9810 and Exynos9830 tests, including retry/reconnect handling after IMS bearer loss or failed REGISTER attempts. |
+| VoLTE outgoing calls | Working in tested configs, including Android call UI, SIP setup, RTP, BYE handling, and two-way audio when ROM-side audio fixes are present. |
+| VoLTE incoming calls | Working in current tests for accept, local end, remote end, and reject paths. Re-test after every dialog/call-state change. |
+| VoWiFi | Working enough for current testing. IWLAN/LTE route changes are still sensitive and depend heavily on QNS / CarrierConfig behavior. |
+| Active VoLTE ↔ VoWiFi switching | Current code defers tech-only IMS reconnects while a call is active/pending or while media threads are still running, so QNS LTE/IWLAN flips no longer kill RTP and leave a fake silent call. Phone-info may still show the original registration tech until the call ends. |
+| SMS over IMS | Basic send/receive path tested. Hardcoded carrier SMSC fallback was removed; the app now relies on framework/identity/SmsManager SMSC sources. |
+| USSD/MMI | IMS UT/USSD is not the current goal. Potential USSD/MMI requests are routed over CS when IMS UT/USSD is unavailable. |
 | Video calling / RCS / UT | Not a goal for now. Voice and basic SMS are the focus. |
 
-A typical failure mode is: the phone shows LTE, but IMS is not registered, Android falls back to circuit-switched calling, and the modem drops to 2G/EDGE for the call. In that case the interesting logs are around IMS network acquisition, P-CSCF discovery, SIP REGISTER, 401 challenge handling, and reconnect retry behavior.
+A common non-IMS fallback mode is: Android has no usable IMS registration when a call starts, so telephony uses circuit-switched fallback and the modem may drop to GSM/EDGE during the call. In that case, inspect IMS network acquisition, P-CSCF discovery, SIP REGISTER, 401 challenge handling, and reconnect retry behavior before assuming the SIP call path failed.
 
 ## Important Samsung-specific background
 
-This fork exists because Samsung devices usually do not expose a clean, generic AOSP IMS stack. A working ROM needs cooperation between several layers:
+Samsung devices usually do not expose a clean generic AOSP IMS stack. A working ROM needs cooperation between several layers:
 
 1. Android telephony must bind this package as the MmTel IMS provider.
 2. Carrier config and framework overlays must expose VoLTE/VoWiFi capability.
 3. The RIL must expose a usable IMS APN/network and P-CSCF information, or DNS fallback must work.
 4. Samsung audio HAL routing must allow userspace RTP audio instead of forcing modem/baseband call paths.
-5. IMS registration must survive network loss, IWLAN/LTE transitions, and REGISTER failures.
+5. IMS registration must survive network loss, IWLAN/LTE transitions, REGISTER failures, and Android/QNS route changes.
 6. Incoming SIP dialog state must be bridged correctly into Android call sessions, otherwise the UI may show an incoming call while the remote side keeps ringing.
 
 The code has been iterated around these problem areas:
@@ -58,14 +60,14 @@ The code has been iterated around these problem areas:
 - delayed SIP handler startup until a valid service state/RPLMN exists
 - correct AKA challenge realm handling for SIP registration
 - reconnect/backoff after IMS bearer loss or failed REGISTER attempts
-- avoiding IMS access switches while a call is active or pending
+- avoiding IMS access switches while a call is active, pending, or media is still running
 - outgoing provisional response handling for ringback/progress
 - separate incoming/outgoing call session state
 - incoming `INVITE` parsing robustness
 - incoming accept path: build dialog state before notifying Android, then send `200 OK` and handle ACK correctly
 - incoming reject path: signal busy/reject to the remote side instead of only closing Android UI state
 - call cleanup after BYE/CANCEL/network failure
-- SMS-over-IMS plumbing via the same SIP handler
+- SMS-over-IMS plumbing through the same SIP handler
 
 ## Repository integration
 
@@ -111,7 +113,7 @@ PRODUCT_PACKAGES += \
 
 ## Device tree integration
 
-The exact paths differ per tree, but a Samsung Exynos device usually needs the following pieces.
+The exact paths differ per tree, but current Samsung Exynos9810 / Exynos9830 integration usually needs the following pieces.
 
 ### Packages
 
@@ -147,7 +149,6 @@ Example: `overlay/frameworks/base/core/res/res/values/config.xml`
     <bool name="config_carrier_volte_available">true</bool>
     <bool name="config_device_volte_available">true</bool>
     <bool name="config_device_vt_available">true</bool>
-
     <string name="config_wlan_data_service_package">com.google.android.iwlan</string>
     <string name="config_wlan_network_service_package">com.google.android.iwlan</string>
     <string name="config_qualified_networks_service_package">com.android.telephony.qns</string>
@@ -185,18 +186,22 @@ Example file:
 </permissions>
 ```
 
-### Carrier config overlay
+### CarrierConfig overlay
 
-A real device tree should also carry a carrier config overlay for the tested carrier/device combination. The debug properties above may make the UI expose toggles, but stable behavior should come from proper CarrierConfig values.
+A real device tree should carry a CarrierConfig overlay for the tested carrier/device combination. The debug properties above may make the UI expose toggles, but stable behavior should come from proper CarrierConfig values.
 
 Useful areas to check:
 
 - `carrier_volte_available_bool`
 - `editable_enhanced_4g_lte_bool`
 - `carrier_wfc_ims_available_bool`
+- `carrier_wfc_supports_wifi_only_bool`
+- `carrier_default_wfc_ims_enabled_bool`
+- `carrier_default_wfc_ims_mode_int`
 - `editable_wfc_mode_bool`
 - IMS SMS availability
 - default WFC mode and roaming behavior
+- IWLAN handover policy / integrity algorithm quirks where required by the carrier/device
 
 ### Vendor IMS properties / sepolicy
 
@@ -219,15 +224,55 @@ vendor.ril.ims.                u:object_r:vendor_ims_prop:s0
 allow sehradiomanager vendor_ims_prop:property_service set;
 ```
 
+## Exynos9810 integration notes
+
+Current Exynos9810 testing covers the Galaxy S9 / S9+ / Note9 family (`starlte`, `star2lte`, `crownlte`) on LineageOS 23.x.
+
+Known ROM-side pieces used in current testing:
+
+- Add `PhhIms`, `Iwlan`, and `QualifiedNetworksService` to the device/common product packages.
+- Bind `me.phh.ims` as the MmTel provider through the Telephony overlay.
+- Expose VoLTE/VoWiFi capability through framework overlays and carrier config.
+- Carry a CarrierConfig overlay for the tested carrier. For Telefónica Germany family testing this includes deterministic WFC availability and IWLAN behavior.
+- Use ROM-side audio HAL fixes where needed. The current Exynos9810 audio bring-up uses an `EXYNOS9810_CALLVOL_FIX` Soong flag in the Samsung audio HAL to map Android call volume to the Samsung receiver gain mixer control.
+- Keep Samsung RIL / IMS property sepolicy in sync if your tree exposes `vendor.ril.ims.*` properties.
+
+Validation checklist used for Exynos9810:
+
+- IMS registers on LTE.
+- Outgoing VoLTE call connects, has ringback/progress, two-way audio, and clean BYE handling.
+- Incoming VoLTE accept, local end, remote end, and reject work.
+- SMS send and receive work after IMS reconnects.
+- USSD/MMI routes over CS when IMS UT/USSD is unavailable.
+- VoWiFi registers and calls work when WFC is enabled.
+- VoLTE ↔ VoWiFi transitions do not leave stale/frozen IMS registration.
+- Active-call LTE/IWLAN tech-only switches do not kill RTP/media.
+
+## Exynos9830 integration notes
+
+Current Exynos9830 testing covers the Galaxy S20 5G / Exynos9830 family, mainly `x1s`, on LineageOS 23.x.
+
+Known ROM-side pieces used in current testing:
+
+- Add `PhhIms`, `Iwlan`, and `QualifiedNetworksService` to the product packages.
+- Bind `me.phh.ims` as the MmTel provider.
+- Expose VoLTE/VoWiFi capability through framework overlays and carrier config.
+- Include the WLAN data service, WLAN network service, and QNS framework overlay strings.
+- Use carrier config for WFC availability/defaults and IWLAN handover behavior.
+- Be aware that QNS may select IWLAN while idle when LTE quality is weak even when the user-facing WFC mode looks like “mobile preferred”. This is expected Android/QNS policy behavior, not a SipHandler-triggered switch.
+
+Validation checklist used for Exynos9830:
+
+- IMS registers on LTE.
+- IMS can register on IWLAN / VoWiFi when WFC is enabled.
+- Outgoing and incoming calls work on VoLTE and VoWiFi.
+- LTE ↔ IWLAN route changes during active calls keep audio alive.
+- Phone-info may keep showing the original IMS registration tech during a deferred active-call switch; the important runtime check is that RTP and DTMF continue.
+- If IMS is unavailable when a call starts, Android may use CS fallback and show GSM/GPRS/2G radio tech for that call.
+
 ## Samsung audio notes
 
 Audio is not solved only inside this app. Samsung HALs often special-case cellular calls and may route capture/playback through modem/baseband paths instead of normal userspace audio paths.
-
-### Exynos850 / A21s
-
-The original A21s bring-up required a binary patch for `libaudioproxy.so`. The HAL only armed the microphone mixer path when an internal Samsung `proxy_mode` was in a specific range. Software IMS calls missed that range, so `AudioRecord` opened but returned silence.
-
-The documented fix is a 2-byte NOP patch in `proxy_open_capture_stream`, described in [`RE/README.md`](RE/README.md).
 
 ### Exynos9810 / S9 family
 
@@ -251,7 +296,18 @@ adb shell dumpsys connectivity
 adb shell dumpsys package me.phh.ims
 ```
 
-For logs:
+For focused IMS logs:
+
+```sh
+adb logcat -c
+adb logcat -v threadtime \
+  'PHH SipHandler:D' 'PHH SipConnection:D' 'PHH MmTelFeature:D' \
+  'ImsPhone:D' 'ImsPhoneCallTracker:D' 'DNC-0:D' 'TNP:D' \
+  'Qns:*' 'QualifiedNetworksService:*' 'Iwlan:*' \
+  '*:S'
+```
+
+For broad logs:
 
 ```sh
 adb logcat -b all -v threadtime | grep -iE \
@@ -291,6 +347,36 @@ Check:
 - whether a call is active or pending while access changes
 - stale `NetworkCallback` state
 - reconnect/re-request of the IMS bearer after access becomes unsuitable
+- whether the switch was only a tech-only LTE/IWLAN change with unchanged network/local address/P-CSCF
+
+### Active call goes silent after LTE ↔ IWLAN switch
+
+Check for a tech-only IMS access switch during the call:
+
+```text
+networkChanged=false
+localChanged=false
+pcscfChanged=false
+techChanged=true
+```
+
+Current code should log and defer that reconnect while the call is active, pending, or media threads are still running:
+
+```text
+Deferring tech-only IMS reconnect while SIP call is active or pending
+```
+
+If media dies immediately after the switch, check for accidental cleanup from:
+
+```text
+Stopping call runtime state: IMS reconnect
+Encode thread exiting: callStopped=true
+Decode thread cleanup complete: callStopped=true
+```
+
+### Phone-info shows stale VoLTE/VoWiFi during active-call switching
+
+This can be expected with the current deferral behavior. The app intentionally avoids re-registering mid-call for tech-only LTE/IWLAN changes, because reconnecting can kill RTP/media and leave a fake silent call. The important checks are whether RTP continues, DTMF works, and the call ends cleanly.
 
 ### Incoming call UI appears, but remote keeps ringing
 
@@ -329,7 +415,9 @@ Android should be notified with call-session progress before final answer, other
 
 ### Audio is one-way or silent
 
-Separate SIP success from audio routing. If SIP says the call is established but audio is broken, check:
+Separate SIP success from audio routing.
+
+If SIP says the call is established but audio is broken, check:
 
 - Android audio mode used by Telecom
 - Samsung HAL route/mixer state
@@ -349,7 +437,7 @@ ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
 A last-resort manual override is available:
 
 ```sh
-adb shell setprop persist.ims.pcscf_fallback <ip-address>
+adb shell setprop persist.ims.pcscf_fallback <ip>
 ```
 
 ## Enabling VoLTE toggle state
@@ -373,8 +461,8 @@ For ROM integration, use the in-tree Soong build instead.
 - The app has no launcher icon and does not appear in the app drawer.
 - The app must be privileged and platform-signed.
 - Carrier provisioning still matters. A carrier that does not provision IMS for the SIM/device combination may never register.
-- Keep VoLTE, VoWiFi, SMS, and audio changes in separate commits while rebasing; it makes regressions much easier to isolate.
-- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming reject, SMS, VoWiFi-only, VoLTE-only, and VoWiFi→VoLTE transitions.
+- Keep registration, VoLTE, VoWiFi, SMS, and audio changes in separate commits while rebasing; it makes regressions much easier to isolate.
+- For Samsung bring-up, always test: registration, outgoing call, incoming accept, incoming reject, SMS, VoWiFi-only, VoLTE-only, VoLTE→VoWiFi, VoWiFi→VoLTE, and active-call route switching.
 
 ## License
 
