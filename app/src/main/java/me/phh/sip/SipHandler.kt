@@ -3,19 +3,12 @@ package me.phh.sip
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.database.ContentObserver
 import android.media.*
 import android.net.*
 import android.os.Handler
 import android.os.HandlerThread
-import android.telephony.CellInfoGsm
-import android.telephony.CellInfoLte
-import android.telephony.CellInfoNr
-import android.telephony.CellInfoWcdma
-import android.telephony.PhoneNumberUtils
 import android.telephony.Rlog
 import android.telephony.SmsManager
-import android.telephony.SubscriptionManager
 import android.net.TelephonyNetworkSpecifier
 import android.telephony.TelephonyManager
 import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_IWLAN
@@ -44,36 +37,14 @@ class SipHandler(
     val myHandler = Handler(HandlerThread("PhhMmTelFeature").apply { start() }.looper)
     val myExecutor = Executor { p0 -> myHandler.post(p0) }
 
-    private val subscriptionManager: SubscriptionManager
     private val telephonyManager: TelephonyManager
     private val connectivityManager: ConnectivityManager
     private val ipSecManager: IpSecManager
     init {
-        subscriptionManager = ctxt.getSystemService(SubscriptionManager::class.java)
         telephonyManager = ctxt.getSystemService(TelephonyManager::class.java)
         connectivityManager = ctxt.getSystemService(ConnectivityManager::class.java)
         ipSecManager = ctxt.getSystemService(IpSecManager::class.java)
     }
-
-    private fun getActiveSubscriptionForSlot(): android.telephony.SubscriptionInfo {
-        val activeSubscriptions = subscriptionManager.activeSubscriptionInfoList.orEmpty()
-
-        return activeSubscriptions.firstOrNull {
-            it.simSlotIndex == slotId && it.subscriptionId == requestedSubId
-        } ?: activeSubscriptions.firstOrNull {
-            it.subscriptionId == requestedSubId
-        } ?: activeSubscriptions.firstOrNull {
-            it.simSlotIndex == slotId
-        } ?: throw IllegalStateException(
-            "No active subscription for slotId=$slotId requestedSubId=$requestedSubId"
-        )
-    }
-
-    private fun getDeviceIdForSlot(slotIndex: Int) =
-        telephonyManager.getImei(slotIndex)
-
-    private fun getAllCellInfoForRegistrationLog() =
-        subTelephonyManager.getAllCellInfo()
 
     private fun createVoiceCommunicationAudioRecord(bufferSize: Int): AudioRecord =
         AudioRecord(
@@ -84,99 +55,40 @@ class SipHandler(
             bufferSize,
         )
 
-    private val activeSubscription = getActiveSubscriptionForSlot()
-    private val subId = activeSubscription.subscriptionId
-    private val subTelephonyManager = telephonyManager.createForSubscriptionId(subId)
-    private val imei = getDeviceIdForSlot(activeSubscription.simSlotIndex)
+    private val subscriptionContext = SipSubscriptionContext.resolve(
+        ctxt = ctxt,
+        telephonyManager = telephonyManager,
+        slotId = slotId,
+        requestedSubId = requestedSubId,
+    )
+    private val activeSubscription = subscriptionContext.activeSubscription
+    private val subId = subscriptionContext.subId
+    private val subTelephonyManager = subscriptionContext.telephonyManager
+    private val imei = subscriptionContext.imei
 
-    private val simInfoUri = Uri.parse("content://telephony/siminfo")
-    private fun normalizeOutgoingDialTargetForTelUri(rawPhoneNumber: String): String {
-        val stripped = PhoneNumberUtils.stripSeparators(rawPhoneNumber).trim()
+    private fun normalizeOutgoingDialTargetForTelUri(rawPhoneNumber: String): String =
+        OutgoingDialTargetNormalizer.normalize(
+            rawPhoneNumber = rawPhoneNumber,
+            activeSubscription = activeSubscription,
+            telephonyManager = subTelephonyManager,
+            logTag = TAG,
+        )
 
-        if (stripped.isEmpty()) return stripped
-
-        // Keep MMI/USSD, post-dial sequences and carrier/service codes in their
-        // original form. They are not normal public E.164 dial targets.
-        if (stripped.any { it == '*' || it == '#' || it == ',' || it == ';' }) {
-            return stripped
-        }
-
-        // Already a global TEL URI target.
-        if (stripped.startsWith("+")) {
-            return stripped
-        }
-
-        // Android's framework can pass international-prefix form unchanged
-        // (for example 0049...). IMS cores behave more consistently with +E.164.
-        if (stripped.startsWith("00") &&
-            stripped.length > 2 &&
-            stripped.drop(2).all { it.isDigit() }) {
-            return "+" + stripped.drop(2)
-        }
-
-        // Only rewrite obvious national public numbers. Short codes like 110,
-        // 112, 116117, mailbox codes, etc. must keep their original form.
-        if (!stripped.all { it.isDigit() } || !stripped.startsWith("0")) {
-            return stripped
-        }
-
-        val countryIso = listOf(
-            activeSubscription.countryIso,
-            subTelephonyManager.simCountryIso,
-            subTelephonyManager.networkCountryIso,
-        ).firstOrNull { !it.isNullOrBlank() }
-
-        val e164 = countryIso?.let { iso ->
-            PhoneNumberUtils.formatNumberToE164(stripped, iso.uppercase())
-        }
-
-        if (e164 == null) {
-            Rlog.w(
-                TAG,
-                "Could not normalize outgoing dial target to E.164: " +
-                    "raw=$rawPhoneNumber stripped=$stripped countryIso=$countryIso",
-            )
-            return stripped
-        }
-
-        return e164
-    }
-
-    @Volatile private var observedWfcEnabled: Boolean? = null
-private val wfcSubscriptionObserver = object : ContentObserver(myHandler) {
-        override fun onChange(selfChange: Boolean) {
-            handleWfcSubscriptionSettingChanged("siminfo observer")
-        }
-
-        override fun onChange(selfChange: Boolean, uri: Uri?) {
-            handleWfcSubscriptionSettingChanged("siminfo observer uri=$uri")
-        }
-    }
-
-    init {
-        registerWfcSubscriptionObserver()
-    }
-    private val mcc = subTelephonyManager.simOperator.substring(0 until 3)
-    private var mnc =
-        subTelephonyManager.simOperator.substring(3).let { if (it.length == 2) "0$it" else it }
+    private val wfcSubscriptionSettingMonitor = WfcSubscriptionSettingMonitor(
+        tag = TAG,
+        ctxt = ctxt,
+        handler = myHandler,
+        subId = subId,
+        onWfcDisabled = { reason -> onWfcDisabled(reason) },
+    ).also { it.start() }
+    private val carrierSettings = SipCarrierSettings.fromSimOperator(subTelephonyManager.simOperator)
+    private val mcc = carrierSettings.mcc
+    private val mnc = carrierSettings.mnc
     private val imsi = subTelephonyManager.subscriberId
 
-    /* Carrier specific settings
-     */
-    val isControlSocketUdp = when(mcc + mnc) {
-        "450006" -> true // LG U+ can only do UDP
-        "208010" -> true // 20810 can do TCP and UDP. use this for testing
-        else -> false
-    }
-    val forceSmsc = when(mcc + mnc) {
-        "450006" -> "821080010585" // LG U+
-        else -> null
-    }
-    // Sess is more secure so default to it
-    val requireNonsessAka = when(mcc + mnc) {
-        "450006" -> true
-        else -> false
-    }
+    val isControlSocketUdp = carrierSettings.isControlSocketUdp
+    val forceSmsc = carrierSettings.forceSmsc
+    val requireNonsessAka = carrierSettings.requireNonsessAka
 
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
@@ -201,14 +113,6 @@ private val wfcSubscriptionObserver = object : ContentObserver(myHandler) {
     lateinit private var localAddr: InetAddress
     lateinit private var pcscfAddr: InetAddress
 
-    data class SipIpsecSettings(
-        val clientSpiC: IpSecManager.SecurityParameterIndex,
-        val clientSpiS: IpSecManager.SecurityParameterIndex,
-        val serverSpiC: IpSecManager.SecurityParameterIndex? = null,
-        val serverSpiS: IpSecManager.SecurityParameterIndex? = null,
-        val serverInTransform: IpSecTransform? = null,
-        val serverOutTransform: IpSecTransform? = null,
-    )
     lateinit var ipsecSettings: SipIpsecSettings
     private var ipsecResourcesClosed = true
 
@@ -390,48 +294,19 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         currentCall = null
         clearPendingOutgoingInvite(closeRtpSocket = true, reason = "IMS reconnect")
         callGeneration.incrementAndGet()
-        synchronized(prAckWaitLock) {
-            prAckWait.clear()
-            prAckWaitLock.notifyAll()
-        }
+        prAckWaitTracker.clearAndNotifyAll()
         dispatcher.clearCallbacks()
         dispatcher.clearWriters()
         smsHandler.clearState()
     }
 
 
-    private fun closeBounded(
-        label: String,
-        timeoutMs: Long = 1_000L,
-        close: () -> Unit,
-    ) {
-        val finished = AtomicBoolean(false)
-        var failure: Throwable? = null
-        val closeThread = thread(name = "PhhImsClose-$label", isDaemon = true) {
-            try {
-                close()
-            } catch (t: Throwable) {
-                failure = t
-            } finally {
-                finished.set(true)
-            }
-        }
-
-        closeThread.join(timeoutMs)
-        if (!finished.get()) {
-            Rlog.w(TAG, "close $label still running after ${timeoutMs}ms; continuing IMS reconnect")
-            return
-        }
-
-        failure?.let { Rlog.d(TAG, "close $label failed", it) }
-    }
-
     private fun closeSipTransports(reason: String) {
         Rlog.w(TAG, "Closing SIP transports: $reason")
-        closeBounded("plainSocket") { if (this::plainSocket.isInitialized) plainSocket.close() }
-        closeBounded("socket") { if (this::socket.isInitialized) socket.close() }
-        closeBounded("TCP server") { if (this::serverSocket.isInitialized) serverSocket.close() }
-        closeBounded("UDP server") { if (this::serverSocketUdp.isInitialized) serverSocketUdp.close() }
+        BoundedCloser.close(TAG, "plainSocket") { if (this::plainSocket.isInitialized) plainSocket.close() }
+        BoundedCloser.close(TAG, "socket") { if (this::socket.isInitialized) socket.close() }
+        BoundedCloser.close(TAG, "TCP server") { if (this::serverSocket.isInitialized) serverSocket.close() }
+        BoundedCloser.close(TAG, "UDP server") { if (this::serverSocketUdp.isInitialized) serverSocketUdp.close() }
     }
 
 
@@ -441,36 +316,15 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         label: String,
         timeoutMs: Long = 10_000L,
     ) {
-        val finished = AtomicBoolean(false)
-        var failure: Throwable? = null
-        val connectThread = thread(name = "PhhImsSocketConnect-$label", isDaemon = true) {
-            try {
-                Rlog.d(TAG, "$label SIP socket connect start remote=$pcscfAddr:$remotePort")
-                connection.connect(remotePort)
-            } catch (t: Throwable) {
-                failure = t
-            } finally {
-                finished.set(true)
-            }
-        }
-
-        connectThread.join(timeoutMs)
-        if (!finished.get()) {
-            val reason = "$label SIP socket connect timed out after ${timeoutMs}ms to $pcscfAddr:$remotePort"
-            Rlog.w(TAG, reason)
-            try {
-                connection.close()
-            } catch (t: Throwable) {
-                Rlog.d(TAG, "close timed-out $label SIP socket failed", t)
-            }
-            connectThread.join(1000L)
-            throw SocketTimeoutException(reason)
-        }
-
-        failure?.let { throw it }
-        Rlog.d(TAG, "$label SIP socket connect completed remote=$pcscfAddr:$remotePort")
+        SipOperationWatchdog.connectSipSocket(
+            logTag = TAG,
+            connection = connection,
+            remoteAddress = pcscfAddr,
+            remotePort = remotePort,
+            label = label,
+            timeoutMs = timeoutMs,
+        )
     }
-
 
     private fun allocateSecurityParameterIndexWithWatchdog(
         label: String,
@@ -478,40 +332,14 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         requestedSpi: Int? = null,
         timeoutMs: Long = 10_000L,
     ): IpSecManager.SecurityParameterIndex {
-        val finished = AtomicBoolean(false)
-        var allocated: IpSecManager.SecurityParameterIndex? = null
-        var failure: Throwable? = null
-        val allocThread = thread(name = "PhhImsIpsecAllocate-$label", isDaemon = true) {
-            try {
-                Rlog.d(
-                    TAG,
-                    "$label allocation start address=$address" +
-                        if (requestedSpi != null) " requestedSpi=$requestedSpi" else "",
-                )
-                allocated = if (requestedSpi != null) {
-                    ipSecManager.allocateSecurityParameterIndex(address, requestedSpi)
-                } else {
-                    ipSecManager.allocateSecurityParameterIndex(address)
-                }
-            } catch (t: Throwable) {
-                failure = t
-            } finally {
-                finished.set(true)
-            }
-        }
-
-        allocThread.join(timeoutMs)
-        if (!finished.get()) {
-            val reason = "$label allocation timed out after ${timeoutMs}ms address=$address" +
-                if (requestedSpi != null) " requestedSpi=$requestedSpi" else ""
-            Rlog.w(TAG, reason)
-            throw SocketTimeoutException(reason)
-        }
-
-        failure?.let { throw it }
-        val result = allocated ?: throw SocketTimeoutException("$label allocation returned no SPI")
-        Rlog.d(TAG, "$label allocation completed spi=${result.spi}")
-        return result
+        return SipOperationWatchdog.allocateSecurityParameterIndex(
+            logTag = TAG,
+            ipSecManager = ipSecManager,
+            label = label,
+            address = address,
+            requestedSpi = requestedSpi,
+            timeoutMs = timeoutMs,
+        )
     }
 
     private fun closeIpsecResources(reason: String) {
@@ -520,12 +348,12 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         ipsecResourcesClosed = true
         Rlog.w(TAG, "Closing SIP IPsec resources: $reason")
 
-        closeBounded("serverInTransform") { settings.serverInTransform?.close() }
-        closeBounded("serverOutTransform") { settings.serverOutTransform?.close() }
-        closeBounded("serverSpiC") { settings.serverSpiC?.close() }
-        closeBounded("serverSpiS") { settings.serverSpiS?.close() }
-        closeBounded("clientSpiC") { settings.clientSpiC.close() }
-        closeBounded("clientSpiS") { settings.clientSpiS.close() }
+        BoundedCloser.close(TAG, "serverInTransform") { settings.serverInTransform?.close() }
+        BoundedCloser.close(TAG, "serverOutTransform") { settings.serverOutTransform?.close() }
+        BoundedCloser.close(TAG, "serverSpiC") { settings.serverSpiC?.close() }
+        BoundedCloser.close(TAG, "serverSpiS") { settings.serverSpiS?.close() }
+        BoundedCloser.close(TAG, "clientSpiC") { settings.clientSpiC.close() }
+        BoundedCloser.close(TAG, "clientSpiS") { settings.clientSpiS.close() }
     }
     private fun dropImsConnection(reason: String) {
         val wasReady = imsReady
@@ -576,57 +404,6 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         imsNetworkRequestRestarter.schedule(reason, initialDelayMs)
     }
 
-
-    private fun readWfcEnabledSubscriptionProperty(): Boolean? {
-        return try {
-            ctxt.contentResolver.query(
-                simInfoUri,
-                arrayOf("_id", "wfc_ims_enabled"),
-                null,
-                null,
-                null,
-            )?.use { cursor ->
-                val idColumn = cursor.getColumnIndex("_id")
-                val wfcColumn = cursor.getColumnIndex("wfc_ims_enabled")
-                if (idColumn < 0 || wfcColumn < 0) {
-                    Rlog.w(TAG, "siminfo is missing WFC columns id=$idColumn wfc=$wfcColumn")
-                    return null
-                }
-                while (cursor.moveToNext()) {
-                    if (cursor.getInt(idColumn) == subId) {
-                        return cursor.getInt(wfcColumn) == 1
-                    }
-                }
-                Rlog.w(TAG, "No siminfo row found for subId=$subId while checking WFC")
-                null
-            }
-        } catch (t: Throwable) {
-            Rlog.d(TAG, "Reading WFC subscription property failed", t)
-            null
-        }
-    }
-
-    private fun registerWfcSubscriptionObserver() {
-        observedWfcEnabled = readWfcEnabledSubscriptionProperty()
-        Rlog.d(TAG, "Initial WFC subscription setting enabled=$observedWfcEnabled")
-        try {
-            ctxt.contentResolver.registerContentObserver(simInfoUri, true, wfcSubscriptionObserver)
-            Rlog.d(TAG, "Registered WFC subscription setting observer")
-        } catch (t: Throwable) {
-            Rlog.d(TAG, "Registering WFC subscription setting observer failed", t)
-        }
-    }
-
-    private fun handleWfcSubscriptionSettingChanged(reason: String) {
-        val enabled = readWfcEnabledSubscriptionProperty() ?: return
-        val old = observedWfcEnabled
-        observedWfcEnabled = enabled
-        if (old == enabled) return
-        Rlog.d(TAG, "WFC subscription setting changed old=$old enabled=$enabled reason=$reason")
-        if (old == true && !enabled) {
-            onWfcDisabled(reason)
-        }
-    }
 
     private fun shouldReconnectAfterSipTransportLoss(reason: String): Boolean {
         if (pendingCellularReconnectAfterWfcDisable) {
@@ -767,28 +544,15 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         Rlog.d(TAG, "Requesting AKA challenge")
         val akaResult = sipAkaChallenge(subTelephonyManager, nonceB64)
-        // Use non-sess digest when server doesn't offer qop (no cnonce/nc in response).
-        akaDigest =
-            if(requireNonsessAka || wwwAuthenticateParams["qop"] == null)
-                SipAkaDigest(
-                    user = user,
-                    realm = challengeRealm,
-                    uri = "sip:$realm",
-                    nonceB64 = nonceB64,
-                    opaque = wwwAuthenticateParams["opaque"],
-                    akaResult = akaResult
-                )
-                .toString()
-            else
-            SipAkaDigestSess(
-                    user = user,
-                    realm = challengeRealm,
-                    uri = "sip:$realm",
-                    nonceB64 = nonceB64,
-                    opaque = wwwAuthenticateParams["opaque"],
-                    akaResult = akaResult
-                )
-                .toString()
+        akaDigest = SipRegistrationDigestFactory.create(
+            user = user,
+            realm = challengeRealm,
+            uri = "sip:$realm",
+            nonceB64 = nonceB64,
+            opaque = wwwAuthenticateParams["opaque"],
+            akaResult = akaResult,
+            useNonsessAka = requireNonsessAka || wwwAuthenticateParams["qop"] == null,
+        )
 
         var portS = 5060
         // Check if there is a security-server header in the reply
@@ -1127,26 +891,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         commonHeaders += newHeaders
     }
     fun register(_writer: OutputStream? = null) {
-        val cellInfoList = getAllCellInfoForRegistrationLog()
-        for(cell in cellInfoList) {
-            if(cell is CellInfoLte) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "LTE cell: ${cellIdentity.ci}, ${cellIdentity.pci}, ${cellIdentity.tac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            } else if(cell is CellInfoNr) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "NR cell: ${cellIdentity.operatorAlphaLong}, ${cellIdentity.operatorAlphaShort}, ${cellIdentity}")
-            } else if(cell is CellInfoWcdma) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "WCDMA cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            } else if(cell is CellInfoGsm) {
-                val cellIdentity = cell.cellIdentity
-                val cellSignalStrength = cell.cellSignalStrength
-                Rlog.d(TAG, "GSM cell: ${cellIdentity.cid}, ${cellIdentity.lac}, ${cellIdentity.mccString}, ${cellIdentity.mncString}, ${cellSignalStrength.dbm}")
-            }
-        }
+        RegistrationCellInfoLogger.log(TAG, subTelephonyManager)
 
         // XXX samsung rom apparently regenerates local SPIC/SPIS every register,
         // this doesn't affect current connections but possibly affects new incoming
@@ -1157,14 +902,11 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
         val writer = _writer ?: socket.gWriter()
 
-        fun secClient(alg: String, ealg: String) =
-            "ipsec-3gpp;prot=esp;mod=trans;spi-c=${ipsecSettings.clientSpiC.spi};spi-s=${ipsecSettings.clientSpiS.spi};port-c=${socket.gLocalPort()};port-s=${serverSocket.localPort};ealg=${ealg};alg=${alg}"
-
-        val algs = listOf("hmac-sha-1-96", "hmac-md5-96")
-        val ealgs = listOf("null", "aes-cbc")
-        val secClients = algs.flatMap { alg -> ealgs.map { ealg -> secClient(alg, ealg) }}
-        val secClientLine =
-            "Security-Client: ${secClients.joinToString(", ")}"
+        val secClientLine = SipSecurityClientHeader.build(
+            ipsecSettings = ipsecSettings,
+            clientPort = socket.gLocalPort(),
+            serverPort = serverSocket.localPort,
+        )
 
                     //P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=216302ee2003a107
         val msg =
@@ -1278,65 +1020,26 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
     }
 
     fun waitPrack(v: Int) {
-        synchronized(prAckWaitLock) {
-            while (prAckWait.contains(v)) {
-                prAckWaitLock.wait(1000)
-            }
-        }
+        prAckWaitTracker.waitFor(v)
     }
 
     private fun responseHeadersFromRequest(
         request: SipRequest,
         toOverride: List<String>? = null,
         extra: SipHeadersMap = emptyMap(),
-    ): SipHeadersMap {
-        val base = request.headers.filter { (k, _) ->
-            k in listOf("via", "from", "to", "call-id", "cseq", "record-route")
-        }
-        val tagged = if (toOverride != null) base + ("to" to toOverride) else base
-        return tagged + extra
-    }
+    ): SipHeadersMap = SipDialogHeaderBuilder.responseHeadersFromRequest(
+        request = request,
+        toOverride = toOverride,
+        extra = extra,
+    )
 
-    private fun localDialogHeadersForRequest(call: Call, method: SipMethod): SipHeadersMap {
-        val cseq = call.localCseq.getAndIncrement()
-        val base = commonHeaders - "route" - "security-verify" - "require" -
-            "proxy-require" - "content-type" - "content-length" - "record-route" -
-            "rseq" - "p-access-network-info"
-        val directionHeaders = if (call.outgoing) {
-            mapOf(
-                "from" to call.callHeaders["from"]!!,
-                "to" to call.callHeaders["to"]!!,
-            )
-        } else {
-            mapOf(
-                // For an incoming dialog, local side is the original To, remote side is the original From.
-                "from" to call.callHeaders["to"]!!,
-                "to" to call.callHeaders["from"]!!,
-            )
-        }
-        val routeSet = call.callHeaders["route"]?.let { route ->
-            // Confirmed outgoing dialogs store their route set as Route after the final 200 OK.
-            mapOf("route" to route)
-        } ?: call.callHeaders["record-route"]?.let { rr ->
-            // Incoming dialogs still keep the original Record-Route from the INVITE. For the
-            // single-route O2/S9 case we can use it directly as Route for local in-dialog requests.
-            mapOf("route" to rr)
-        } ?: emptyMap()
-        val securityHeaders = commonHeaders["security-verify"]?.let { securityVerify ->
-            // This stack registers with sec-agree/IPsec. Some P-CSCFs also require the
-            // negotiated Security-Verify header on later in-dialog requests such as UPDATE.
-            mapOf(
-                "security-verify" to securityVerify,
-                "require" to listOf("sec-agree"),
-            )
-        } ?: emptyMap()
-        return base + directionHeaders + routeSet + securityHeaders + mapOf("call-id" to call.callHeaders["call-id"]!!) +
-            """
-            Contact: $contact
-            CSeq: $cseq $method
-            Content-Length: 0
-            """.toSipHeadersMap()
-    }
+    private fun localDialogHeadersForRequest(call: Call, method: SipMethod): SipHeadersMap =
+        SipDialogHeaderBuilder.localDialogHeadersForRequest(
+            call = call,
+            method = method,
+            commonHeaders = commonHeaders,
+            contact = contact,
+        )
 
     fun handleAck(request: SipRequest): Int {
         val callId = request.callIdOrEmpty()
@@ -1369,11 +1072,8 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
     fun handlePrack(request: SipRequest): Int {
         Rlog.d(TAG, "Received PRACK for ${request.headers["rack"]!![0]}")
-        synchronized(prAckWaitLock) {
-            val id = request.headers["rack"]!![0].split(" ")[0].toInt()
-            prAckWait -= id
-            prAckWaitLock.notifyAll()
-        }
+        val id = request.headers["rack"]!![0].split(" ")[0].toInt()
+        prAckWaitTracker.ack(id)
         return 200
     }
 
@@ -1648,10 +1348,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
         }
 
         stopCallRuntime("call cleanup")
-        synchronized(prAckWaitLock) {
-            prAckWait.clear()
-            prAckWaitLock.notifyAll()
-        }
+        prAckWaitTracker.clearAndNotifyAll()
 
         Rlog.d(TAG, "Cancelled call $callId method=${request.method}")
 
@@ -2124,13 +1821,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
             // S9/O2 test mode: never block accept on pending incoming PRACK state.
             // The network currently does not PRACK our reliable incoming 183, so
             // waiting here makes the remote side ring until timeout.
-            synchronized(prAckWaitLock) {
-                if (prAckWait.isNotEmpty()) {
-                    Rlog.w(TAG, "Dropping stale PRACK waits before accept: $prAckWait")
-                    prAckWait.clear()
-                    prAckWaitLock.notifyAll()
-                }
-            }
+            prAckWaitTracker.dropStaleBeforeAccept(TAG)
 
             Rlog.d(TAG, "Accepting call")
             val myHeaders = call.callHeaders
@@ -3079,8 +2770,7 @@ a=sendrecv
     private val rtpSequenceNumber = AtomicInteger(0)
     private val rtpTimestampSamples = AtomicInteger(0)
 
-    val prAckWaitLock = Object()
-    var prAckWait = mutableSetOf<Int>()
+    private val prAckWaitTracker = PrackWaitTracker()
 
     private fun handleInDialogInvite(request: SipRequest, call: Call, responseWriter: OutputStream): Int {
         val callId = request.callIdOrEmpty()
@@ -3245,10 +2935,7 @@ a=sendrecv
         incomingAcceptedAwaitingAck.set(false)
         incomingHangupAfterAck.set(false)
         currentCall = null
-        synchronized(prAckWaitLock) {
-            prAckWait.clear()
-            prAckWaitLock.notifyAll()
-        }
+        prAckWaitTracker.clearAndNotifyAll()
 
         val f = request.headers["from"]
         val m = extractCallerNumberFromHeader(f!![0]!!)
@@ -3481,9 +3168,7 @@ a=sendrecv
                         Rlog.d(TAG, "Deferring incoming media threads until final ACK")
 
             if (sendReliable183) {
-                synchronized(prAckWaitLock) {
-                    prAckWait += mySeqCounter
-                }
+                prAckWaitTracker.add(mySeqCounter)
                 val msg =
                     SipResponse(
                         statusCode = 183,
