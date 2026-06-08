@@ -3,13 +3,18 @@ package me.phh.sip
 /**
  * Generic REGISTER negotiation helpers.
  *
- * Some IMS cores challenge the initial home-realm REGISTER with a shorter operator
- * registrar realm, for example realm="ims.example.com" while our default target is
- * ims.mncXXX.mccYYY.3gppnetwork.org.  The authenticated REGISTER must then use the
- * challenged registrar authority consistently as both the Request-URI and digest URI.
+ * Some IMS cores challenge the initial home-realm REGISTER with a registrar
+ * realm that also has to be used as the protected REGISTER authority, for
+ * example realm="ims.example.com" while our default target is the 3GPP home
+ * network domain.
  *
- * This is intentionally not carrier-gated: the network-provided AKA challenge is the
- * source of truth, but we only accept syntactically safe host-like realms.
+ * Other networks expose a shorter operator auth realm only.  A1 HR/21910 uses
+ * realm="vip.hr" for AKA, but still expects the REGISTER Request-URI and Digest
+ * URI to stay on sip:ims.mnc010.mcc219.3gppnetwork.org.  O2 Germany/26203
+ * similarly challenges with an EPC AKA realm, epc.mnc007.mcc262.3gppnetwork.org,
+ * but rejects an authenticated REGISTER sent to that EPC realm.  Therefore the
+ * helper below only promotes challenged realms that look like IMS registrar
+ * domains, not arbitrary 3GPP/EPC auth realms.
  */
 object SipRegisterNegotiationPolicy {
     private val SAFE_HOST_RE = Regex("^[A-Za-z0-9.-]+$")
@@ -37,9 +42,33 @@ object SipRegisterNegotiationPolicy {
         if (candidate.equals(defaultRealm, ignoreCase = true)) return defaultRealm
         if (!candidate.contains('.')) return defaultRealm
         if (!SAFE_HOST_RE.matches(candidate)) return defaultRealm
-        if (isEpcAuthRealm(candidate)) return defaultRealm
         if (candidate.startsWith(".") || candidate.endsWith(".")) return defaultRealm
         if (candidate.contains("..")) return defaultRealm
+
+        /*
+         * The WWW-Authenticate realm is not always the REGISTER authority.
+         * A1 HR/21910 challenges with realm="vip.hr", but the REGISTER
+         * Request-URI and Digest URI must stay on the home IMS domain:
+         * sip:ims.mnc010.mcc219.3gppnetwork.org.  Rewriting that final
+         * protected REGISTER to sip:vip.hr makes the network reject it with
+         * 494 Security Agreement Required.
+         *
+         * Only promote the challenged realm to REGISTER authority when it
+         * looks like an actual IMS registrar domain.  Do not promote EPC
+         * authentication realms such as epc.mnc007.mcc262.3gppnetwork.org:
+         * O2 Germany/26203 uses that realm for AKA, but still expects the
+         * protected REGISTER Request-URI and Digest URI to stay on the
+         * original ims.mnc003.mcc262.3gppnetwork.org home domain.
+         *
+         * This keeps SingTel-style realm="ims.singtel.com" / eims.* cases
+         * working, while treating operator/EPC auth realms such as "vip.hr"
+         * or "epc.*" as Digest realm only.
+         */
+        val looksLikeRegistrarRealm =
+            candidate.startsWith("ims.") ||
+                candidate.startsWith("eims.")
+
+        if (!looksLikeRegistrarRealm) return defaultRealm
 
         return candidate
     }
