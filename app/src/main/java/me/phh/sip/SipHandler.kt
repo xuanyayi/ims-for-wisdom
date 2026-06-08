@@ -90,6 +90,29 @@ class SipHandler(
     private val mnc = carrierSettings.mnc
     private val imsi = subTelephonyManager.subscriberId
 
+    // dual-SIM IMS context logging.
+    // Keep ambiguous SIP/IMS events tied to the exact SipHandler subscription.
+    private fun imsDualSimDebugContext(extra: String = ""): String {
+        val networkText = if (this::network.isInitialized) network.toString() else "unassigned"
+        val localText = if (this::localAddr.isInitialized) localAddr.hostAddress else "unassigned"
+        val pcscfText = if (this::pcscfAddr.isInitialized) pcscfAddr.hostAddress else "unassigned"
+        val ifaceText = try {
+            if (this::network.isInitialized) {
+                connectivityManager.getLinkProperties(network)?.interfaceName ?: "none"
+            } else {
+                "none"
+            }
+        } catch (_: Throwable) {
+            "error"
+        }
+        val base =
+            "slotId=$slotId phoneId=$slotId subId=$subId requestedSubId=$requestedSubId " +
+                "sim=$mcc$mnc realm=$realm net=$networkText if=$ifaceText " +
+                "local=$localText pcscf=$pcscfText"
+        return if (extra.isBlank()) base else "$base $extra"
+    }
+
+
     val isControlSocketUdp = carrierSettings.isControlSocketUdp
     val requireNonsessAka = carrierSettings.requireNonsessAka
 
@@ -1021,7 +1044,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     fun connect() {
         abandonnedBecauseOfNoPcscf = false
         resetRegistrationStateForConnect()
-        Rlog.d(TAG, "Trying to connect to SIP server")
+        Rlog.d(TAG, "Trying to connect to SIP server ${imsDualSimDebugContext()}")
         val lp = connectivityManager.getLinkProperties(network)
         Rlog.d(TAG, "Got link properties $lp")
         if (lp == null) {
@@ -1050,7 +1073,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             }
         }
 
-        Rlog.w(TAG, "Connecting with address $localAddr to $pcscfAddr")
+        Rlog.w(TAG, "Connecting with address ${imsDualSimDebugContext("selectedLocal=$localAddr selectedPcscf=$pcscfAddr")}")
 
         val clientSpiC = allocateSecurityParameterIndexWithWatchdog("client SPI-C", localAddr)
         val clientSpiS = allocateSecurityParameterIndexWithWatchdog("client SPI-S", localAddr, clientSpiC.spi + 1)
@@ -1073,7 +1096,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         serverSocketUdp =
             SipConnectionUdpServer(network, pcscfAddr, plainSocket.gLocalAddr(), socket.gLocalPort() + 1)
 
-        Rlog.d(TAG, "Src port is ${socket.gLocalPort()}, TCP server port is ${serverSocket.localPort}, UDP server port is ${serverSocketUdp.localPort}")
+        Rlog.d(TAG, "SIP ports ${imsDualSimDebugContext("src=${socket.gLocalPort()} tcpServer=${serverSocket.localPort} udpServer=${serverSocketUdp.localPort}")}")
         updateCommonHeaders(plainSocket)
         register(plainSocket.gWriter())
         fun readPlainRegisterReply(): SipMessage? {
@@ -1490,7 +1513,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
     fun getVolteNetwork() {
         // TODO add something similar for VoWifi ipsec tunnel?
-        Rlog.d(TAG, "Requesting IMS network for slotId=$slotId subId=$subId")
+        Rlog.d(TAG, "Requesting IMS network ${imsDualSimDebugContext()}")
         if (!isRatReadyForImsNetworkRequest()) {
             Rlog.w(TAG, "Deferring IMS network request until LTE/NR/IWLAN is back")
             scheduleImsNetworkRequestRestart("RAT not ready for IMS network request")
@@ -1498,17 +1521,17 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         }
         val imsNetworkRequest = ImsNetworkRequestBuilder.buildForSubscription(subId)
 
-        Rlog.d(TAG, "Built subscription-specific IMS network request $imsNetworkRequest")
+        Rlog.d(TAG, "Built subscription-specific IMS network request ${imsDualSimDebugContext("request=$imsNetworkRequest")}")
 
         unregisterImsNetworkCallback("new IMS network request")
 
         val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onUnavailable() {
-                    Rlog.d(TAG, "IMS network unavailable")
+                    Rlog.d(TAG, "IMS network unavailable ${imsDualSimDebugContext()}")
                 }
 
                 override fun onLost(lostNetwork: Network) {
-                    Rlog.d(TAG, "IMS network lost $lostNetwork")
+                    Rlog.d(TAG, "IMS network lost ${imsDualSimDebugContext("lost=$lostNetwork")}")
                     if (this@SipHandler::network.isInitialized && network == lostNetwork) {
                         try {
                     connectivityManager.unregisterNetworkCallback(this)
@@ -1530,13 +1553,13 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 }
 
                 override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
-                    Rlog.d(TAG, "IMS network blocked status changed $blocked")
+                    Rlog.d(TAG, "IMS network blocked status changed ${imsDualSimDebugContext("blocked=$blocked")}")
                 }
                 override fun onCapabilitiesChanged(
                     network: Network,
                     networkCapabilities: NetworkCapabilities
                 ) {
-                    Rlog.d(TAG, "IMS network capabilities changed $networkCapabilities")
+                    Rlog.d(TAG, "IMS network capabilities changed ${imsDualSimDebugContext("capabilities=$networkCapabilities")}")
                     val isCurrentImsNetwork =
                         this@SipHandler::network.isInitialized &&
                             network == this@SipHandler.network
@@ -1563,7 +1586,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                     _network: Network,
                     linkProperties: LinkProperties
                 ) {
-                    Rlog.d(TAG, "IMS network link properties changed $linkProperties")
+                    Rlog.d(TAG, "IMS network link properties changed ${imsDualSimDebugContext("linkProperties=$linkProperties")}")
                     val pcscfs = getPcscfServers(linkProperties)
                     val newLocalAddr = getImsLocalAddress(linkProperties)
                     val newPcscfAddr = pcscfs.firstOrNull()
@@ -1651,7 +1674,7 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
                 }
 
                 override fun onAvailable(_network: Network) {
-                    Rlog.d(TAG, "Got IMS network $_network")
+                    Rlog.d(TAG, "Got IMS network ${imsDualSimDebugContext("network=$_network")}")
                     if (!this@SipHandler::network.isInitialized) {
                         network = _network
                         thread {
@@ -3792,6 +3815,15 @@ if (pcscfs.isNotEmpty() && abandonnedBecauseOfNoPcscf) {
 
                 false // Return true when we want to stop receiving messages for that call
             }
+            Rlog.w(
+                TAG,
+                "Outgoing INVITE send context " +
+                    imsDualSimDebugContext(
+                        "callId=$outgoingInviteCallId cseq=${msg.headers["cseq"]?.getOrNull(0)} " +
+                            "to=$singtelStockOutgoingTargetUri raw=$phoneNumber normalized=$normalizedPhoneNumber " +
+                            "rtp=${rtpSocket.localAddress}:${rtpSocket.localPort} sdpBytes=${outgoingInviteBody.size}"
+                    ),
+            )
             Rlog.d(TAG, "Sending $msg")
             writeSipBytesWithFlush(socket.gWriter(), "SipHandler msg", msg.toByteArray())
         }
