@@ -3,6 +3,8 @@ package me.phh.ims
 
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
 import android.telephony.Rlog
 import android.telephony.ServiceState
@@ -36,6 +38,10 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
     }
 
     var telephonyManager: TelephonyManager? = null
+    private val readyCheckHandler = Handler(Looper.getMainLooper())
+    private val readyCheckExecutor = Executors.newSingleThreadExecutor()
+    private var readyCheckCallback: TelephonyCallback? = null
+    private var readyCheckAttempts = 0
 
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
@@ -53,30 +59,127 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         notifyCapabilitiesStatusChanged(capabilities)
     }
 
-    override fun initialize(context: Context?, slotId: Int) {
-        super.initialize(context, slotId)
-        featureState = STATE_INITIALIZING
+    private fun resolveSubIdForSlot(): Int {
+        val subscriptionManager = mContext.getSystemService(SubscriptionManager::class.java)
 
-        telephonyManager =
-            mContext.getSystemService(TelephonyManager::class.java)
-                .createForSubscriptionId(SubscriptionManager.getSubscriptionId(slotId))
+        val activeSubId = subscriptionManager.activeSubscriptionInfoList
+            .orEmpty()
+            .firstOrNull { it.simSlotIndex == slotId }
+            ?.subscriptionId
 
-        telephonyManager?.registerTelephonyCallback(
-            Executors.newSingleThreadExecutor(),
-            object : TelephonyCallback(), TelephonyCallback.ServiceStateListener {
-                override fun onServiceStateChanged(serviceState: ServiceState) {
-                    // STATE_IN_SERVICE requires SIM unlocked and fully registered.
-                    // During PIN-lock phase state is STATE_EMERGENCY_ONLY — skip it.
-                    if (serviceState.state != ServiceState.STATE_IN_SERVICE) return
-                    serviceState.networkRegistrationInfoList.forEach {
-                        // A valid RPLMN is needed for SipHandler
-                        if (!(it.registeredPlmn?.isEmpty() ?: true)) {
-                            featureState = STATE_READY
-                            telephonyManager?.unregisterTelephonyCallback(this)
-                        }
+        if (activeSubId != null && SubscriptionManager.isValidSubscriptionId(activeSubId)) {
+            return activeSubId
+        }
+
+        val frameworkSubId = SubscriptionManager.getSubscriptionId(slotId)
+        if (SubscriptionManager.isValidSubscriptionId(frameworkSubId)) {
+            return frameworkSubId
+        }
+
+        return SubscriptionManager.INVALID_SUBSCRIPTION_ID
+    }
+
+    private fun markReadyFromServiceState(serviceState: ServiceState, reason: String): Boolean {
+        val registeredPlmn = serviceState.networkRegistrationInfoList
+            .firstOrNull { !it.registeredPlmn.isNullOrEmpty() }
+            ?.registeredPlmn
+
+        if (serviceState.state != ServiceState.STATE_IN_SERVICE || registeredPlmn == null) {
+            Rlog.d(
+                TAG,
+                "$slotId not ready for IMS after $reason: " +
+                    "state=${serviceState.state} registeredPlmn=$registeredPlmn"
+            )
+            return false
+        }
+
+        if (featureState != STATE_READY) {
+            Rlog.d(
+                TAG,
+                "$slotId ready for IMS after $reason: " +
+                    "subId=${resolveSubIdForSlot()} registeredPlmn=$registeredPlmn"
+            )
+            featureState = STATE_READY
+        }
+
+        return true
+    }
+
+    private fun bindReadyCheckTelephonyManager(reason: String) {
+        val subId = resolveSubIdForSlot()
+        if (!SubscriptionManager.isValidSubscriptionId(subId)) {
+            if (readyCheckAttempts < 30) {
+                readyCheckAttempts++
+                Rlog.w(
+                    TAG,
+                    "$slotId no valid subId for IMS ready check after $reason; " +
+                        "retry $readyCheckAttempts"
+                )
+                readyCheckHandler.postDelayed({
+                    bindReadyCheckTelephonyManager("subId retry")
+                }, 1000L)
+            } else {
+                Rlog.w(TAG, "$slotId giving up IMS ready check: no valid subId")
+            }
+            return
+        }
+
+        readyCheckAttempts = 0
+
+        readyCheckCallback?.let { oldCallback ->
+            try {
+                telephonyManager?.unregisterTelephonyCallback(oldCallback)
+            } catch (t: Throwable) {
+                Rlog.d(TAG, "$slotId unregister old IMS ready callback failed: ${t.message}")
+            }
+            readyCheckCallback = null
+        }
+
+        val boundTelephonyManager = mContext
+            .getSystemService(TelephonyManager::class.java)
+            .createForSubscriptionId(subId)
+
+        telephonyManager = boundTelephonyManager
+
+        Rlog.d(TAG, "$slotId binding IMS ready check to subId=$subId after $reason")
+
+        val callback = object : TelephonyCallback(), TelephonyCallback.ServiceStateListener {
+            override fun onServiceStateChanged(serviceState: ServiceState) {
+                if (markReadyFromServiceState(serviceState, "service state callback")) {
+                    try {
+                        boundTelephonyManager.unregisterTelephonyCallback(this)
+                    } catch (t: Throwable) {
+                        Rlog.d(TAG, "$slotId unregister IMS ready callback failed: ${t.message}")
+                    }
+                    if (readyCheckCallback === this) {
+                        readyCheckCallback = null
                     }
                 }
-            })
+            }
+        }
+
+        readyCheckCallback = callback
+        boundTelephonyManager.registerTelephonyCallback(readyCheckExecutor, callback)
+
+        boundTelephonyManager.serviceState?.let { currentState ->
+            if (markReadyFromServiceState(currentState, "current service state")) {
+                try {
+                    boundTelephonyManager.unregisterTelephonyCallback(callback)
+                } catch (t: Throwable) {
+                    Rlog.d(TAG, "$slotId unregister IMS ready callback failed: ${t.message}")
+                }
+                if (readyCheckCallback === callback) {
+                    readyCheckCallback = null
+                }
+            }
+        }
+    }
+
+    override fun initialize(context: Context?, slotId: Int) {
+        super.initialize(context, slotId)
+
+        featureState = STATE_INITIALIZING
+        bindReadyCheckTelephonyManager("initialize")
     }
 
     override fun createCallProfile(callSessionType: Int, callType: Int): ImsCallProfile {
