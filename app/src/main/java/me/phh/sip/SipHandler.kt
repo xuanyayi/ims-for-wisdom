@@ -84,6 +84,8 @@ class SipHandler(
         handler = myHandler,
         subId = subId,
         onWfcDisabled = { reason -> onWfcDisabled(reason) },
+        onWfcPreferenceChanged = { reason -> onWfcPreferenceChanged(reason) },
+        onAirplaneModeDisabled = { reason -> onAirplaneModeDisabled(reason) },
     ).also { it.start() }
     private val carrierSettings = SipCarrierSettings.fromSimOperator(subTelephonyManager.simOperator)
     private val mcc = carrierSettings.mcc
@@ -522,17 +524,25 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
     }
 
     private val IWLAN_CONVERGENCE_OUTGOING_CALL_GUARD_MS = 60_000L
+    private val WFC_WIFI_PREFERRED_IWLAN_READY_RETRY_MS = 1500L
+    private val WFC_WIFI_PREFERRED_IWLAN_READY_TIMEOUT_MS = 20_000L
 
-    private fun isWaitingForIwlanAfterWfcPreferenceChange(): Boolean {
-        if (!wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) {
-            return false
-        }
-        if (imsRegistrationTech != REGISTRATION_TECH_LTE) {
-            return false
-        }
 
+    private fun isWaitingForPreferredImsAccessAfterWfcPreferenceChange(): Boolean {
         val elapsedMs = SystemClock.uptimeMillis() - wfcSubscriptionSettingMonitor.lastChangeUptimeMs()
-        return elapsedMs in 0L..IWLAN_CONVERGENCE_OUTGOING_CALL_GUARD_MS
+        if (elapsedMs !in 0L..IWLAN_CONVERGENCE_OUTGOING_CALL_GUARD_MS) {
+            return false
+        }
+
+        val waitingForIwlan =
+            wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly() &&
+                imsRegistrationTech == REGISTRATION_TECH_LTE
+
+        val waitingForCellular =
+            !wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly() &&
+                imsRegistrationTech == REGISTRATION_TECH_IWLAN
+
+        return waitingForIwlan || waitingForCellular
     }
     fun isReadyForOutgoingCall(): Boolean {
         val baseReady =
@@ -560,12 +570,14 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
             return false
         }
 
-        if (isWaitingForIwlanAfterWfcPreferenceChange()) {
+        if (isWaitingForPreferredImsAccessAfterWfcPreferenceChange()) {
             val elapsedMs = android.os.SystemClock.uptimeMillis() - wfcSubscriptionSettingMonitor.lastChangeUptimeMs()
+            val preferredAccess =
+                if (wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) "IWLAN" else "cellular"
             Rlog.w(
                 TAG,
-                "Rejecting outgoing call while waiting for IWLAN IMS after WFC preference/subscription change: " +
-                    "tech=${registrationTechName(imsRegistrationTech)} elapsedMs=$elapsedMs",
+                "Rejecting outgoing call while waiting for preferred IMS access after WFC preference/subscription change: " +
+                    "preferred=$preferredAccess tech=${registrationTechName(imsRegistrationTech)} elapsedMs=$elapsedMs",
             )
             return false
         }
@@ -787,7 +799,146 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         }
     }
 
-    fun onWfcDisabled(reason: String) {
+    private fun onAirplaneModeDisabled(reason: String) {
+        myHandler.post {
+            val currentTech = imsRegistrationTech
+            if (wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) {
+                Rlog.d(
+                    TAG,
+                    "Keeping IWLAN IMS after airplane mode off because WFC still prefers Wi-Fi: " +
+                        "$reason ready=$imsReady tech=${registrationTechName(currentTech)}",
+                )
+                return@post
+            }
+
+            if (!imsReady || currentTech != REGISTRATION_TECH_IWLAN) {
+                Rlog.d(
+                    TAG,
+                    "Ignoring airplane-mode-off IMS refresh while not registered over IWLAN: " +
+                        "$reason ready=$imsReady tech=${registrationTechName(currentTech)}",
+                )
+                return@post
+            }
+
+            val restartReason = "airplane mode disabled while registered over IWLAN and WFC prefers cellular: $reason"
+            if (currentCall != null) {
+                Rlog.w(
+                    TAG,
+                    "Deferring IMS network request restart for $restartReason because " +
+                        activeOrPendingCallSummaryForReconnectDeferral(),
+                )
+                pendingImsReconnectAfterActiveCallReason = restartReason
+                return@post
+            }
+
+            Rlog.w(TAG, "Restarting IMS network request after $restartReason")
+            reconnectController.invalidatePendingReconnects(restartReason)
+            unregisterImsNetworkCallback(restartReason)
+            dropImsConnection(restartReason)
+            abandonnedBecauseOfNoPcscf = true
+            scheduleImsNetworkRequestRestart(restartReason, 250L)
+        }
+    }
+
+
+    private fun isPsIwlanReadyForWfcPreferenceRestart(): Boolean {
+        val serviceState = try {
+            subTelephonyManager.serviceState
+        } catch (t: Throwable) {
+            Rlog.d(TAG, "Unable to read ServiceState while waiting for IWLAN IMS access", t)
+            null
+        }
+
+        val iwlanRegistration = serviceState?.getNetworkRegistrationInfo(
+            android.telephony.NetworkRegistrationInfo.DOMAIN_PS,
+            android.telephony.AccessNetworkConstants.TRANSPORT_TYPE_WLAN,
+        )
+
+        val iwlanReady =
+            iwlanRegistration?.isNetworkRegistered == true &&
+                iwlanRegistration.accessNetworkTechnology == TelephonyManager.NETWORK_TYPE_IWLAN
+
+        Rlog.d(
+            TAG,
+            "WFC Wi-Fi preferred IWLAN readiness: ready=$iwlanReady " +
+                "reg=${iwlanRegistration?.networkRegistrationState} " +
+                "rat=${iwlanRegistration?.accessNetworkTechnology}",
+        )
+        return iwlanReady
+    }
+
+    private fun restartImsNetworkRequestAfterAccessPreferenceChange(restartReason: String) {
+        if (currentCall != null) {
+            Rlog.w(
+                TAG,
+                "Deferring IMS network request restart for $restartReason because " +
+                    activeOrPendingCallSummaryForReconnectDeferral(),
+            )
+            pendingImsReconnectAfterActiveCallReason = restartReason
+            return
+        }
+
+        Rlog.w(TAG, "Restarting IMS network request after $restartReason")
+        reconnectController.invalidatePendingReconnects(restartReason)
+        unregisterImsNetworkCallback(restartReason)
+        dropImsConnection(restartReason)
+        abandonnedBecauseOfNoPcscf = true
+        scheduleImsNetworkRequestRestart(restartReason, 250L)
+    }
+
+    private fun restartWhenIwlanReadyAfterWfcWifiPreference(
+        restartReason: String,
+        startedUptimeMs: Long,
+    ) {
+        if (!wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) {
+            Rlog.d(TAG, "WFC preference is no longer Wi-Fi preferred while waiting for IWLAN: $restartReason")
+            return
+        }
+
+        if (isPsIwlanReadyForWfcPreferenceRestart()) {
+            restartImsNetworkRequestAfterAccessPreferenceChange(restartReason)
+            return
+        }
+
+        val elapsedMs = SystemClock.uptimeMillis() - startedUptimeMs
+        if (elapsedMs >= WFC_WIFI_PREFERRED_IWLAN_READY_TIMEOUT_MS) {
+            Rlog.w(
+                TAG,
+                "IWLAN did not become ready after WFC Wi-Fi preference change within ${elapsedMs}ms; " +
+                    "restarting IMS request anyway: $restartReason",
+            )
+            restartImsNetworkRequestAfterAccessPreferenceChange(restartReason)
+            return
+        }
+
+        Rlog.d(
+            TAG,
+            "Delaying IMS network request restart until IWLAN is ready after WFC Wi-Fi preference: " +
+                "elapsedMs=$elapsedMs reason=$restartReason",
+        )
+        myHandler.postDelayed({
+            restartWhenIwlanReadyAfterWfcWifiPreference(restartReason, startedUptimeMs)
+        }, WFC_WIFI_PREFERRED_IWLAN_READY_RETRY_MS)
+    }
+
+    private fun onWfcPreferenceChanged(reason: String) {
+        myHandler.post {
+            val restartReason = "WFC preference changed: $reason"
+
+            if (wfcSubscriptionSettingMonitor.isWifiPreferredOrOnly()) {
+                restartWhenIwlanReadyAfterWfcWifiPreference(
+                    restartReason = restartReason,
+                    startedUptimeMs = SystemClock.uptimeMillis(),
+                )
+                return@post
+            }
+
+            restartImsNetworkRequestAfterAccessPreferenceChange(restartReason)
+        }
+    }
+
+
+fun onWfcDisabled(reason: String) {
         myHandler.post {
             if (pendingCellularReconnectAfterWfcDisable) {
                 Rlog.w(TAG, "Ignoring duplicate WFC disabled notification while waiting for cellular IMS link: $reason")

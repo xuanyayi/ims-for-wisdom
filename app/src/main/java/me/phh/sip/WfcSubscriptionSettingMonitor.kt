@@ -2,9 +2,12 @@
 package me.phh.sip
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Handler
+import android.provider.Settings
 import android.os.SystemClock
 import android.telephony.Rlog
 
@@ -14,6 +17,8 @@ class WfcSubscriptionSettingMonitor(
     handler: Handler,
     private val subId: Int,
     private val onWfcDisabled: (String) -> Unit,
+    private val onWfcPreferenceChanged: (String) -> Unit,
+    private val onAirplaneModeDisabled: (String) -> Unit,
 ) {
     private data class WfcState(
         val enabled: Boolean?,
@@ -35,7 +40,39 @@ class WfcSubscriptionSettingMonitor(
         }
     }
 
+
+    private val airplaneModeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != Intent.ACTION_AIRPLANE_MODE_CHANGED) {
+                return
+            }
+
+            val airplaneOn = Settings.Global.getInt(
+                context.contentResolver,
+                Settings.Global.AIRPLANE_MODE_ON,
+                0,
+            ) != 0
+
+            if (!airplaneOn) {
+                val reason = "airplane mode disabled"
+                Rlog.w(tag, "Airplane mode disabled; requesting IMS access refresh")
+                handler.post {
+                    onAirplaneModeDisabled(reason)
+                }
+            }
+        }
+    }
+
     fun start() {
+        try {
+            ctxt.registerReceiver(
+                airplaneModeReceiver,
+                IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED),
+            )
+        } catch (t: Throwable) {
+            Rlog.d(tag, "Failed to register airplane mode receiver", t)
+        }
+
         val state = readState()
         observedWfcEnabled = state.enabled
         observedWfcMode = state.mode
@@ -50,6 +87,11 @@ class WfcSubscriptionSettingMonitor(
     }
 
     fun stop() {
+        try {
+            ctxt.unregisterReceiver(airplaneModeReceiver)
+        } catch (_: Throwable) {
+        }
+
         try {
             ctxt.contentResolver.unregisterContentObserver(observer)
             Rlog.d(tag, "Unregistered WFC subscription setting observer for subId=$subId")
@@ -116,6 +158,10 @@ class WfcSubscriptionSettingMonitor(
 
         if (oldEnabled == true && !enabled) {
             onWfcDisabled(reason)
+        }
+
+        if (oldEnabled == true && enabled && oldMode != state.mode) {
+            onWfcPreferenceChanged(reason)
         }
     }
 
