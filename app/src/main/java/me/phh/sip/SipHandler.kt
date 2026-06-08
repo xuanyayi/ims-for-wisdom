@@ -2447,7 +2447,7 @@ a=sendrecv
                                         val finalInviteHasSdp =
                         resp.headers["content-type"]?.getOrNull(0) == "application/sdp"
 
-if (finalInviteAfterLocalCancel) {
+                    if (finalInviteAfterLocalCancel) {
                         Rlog.w(TAG, "Final INVITE answer arrived after local CANCEL; ACK first, then BYE once dialog state exists callId=$finalInviteCallId")
                     }
                     // ACK C-Seq must be the same as INVITE C-Seq
@@ -2496,8 +2496,16 @@ if (finalInviteAfterLocalCancel) {
                             localCseq = AtomicInteger(keptCseq),
                         )
                     }
-                    Rlog.d(TAG, "Outgoing confirmed dialog: remoteTarget=${currentCall?.remoteContact} nextLocalCseq=${currentCall?.localCseq?.get()} route=${currentCall?.callHeaders?.get("route")}")
-                    Rlog.d(TAG, "Invite got SUCCESS")
+                    currentCall?.let { confirmedCall ->
+                        val routeHeader = confirmedCall.callHeaders["route"]
+                        Rlog.d(
+                            TAG,
+                            "Outgoing confirmed dialog after ACK: " +
+                                "remoteTarget=${confirmedCall.remoteContact} " +
+                                "nextLocalCseq=${confirmedCall.localCseq.get()} " +
+                                "route=$routeHeader",
+                        )
+                    }
                     if (finalInviteAfterLocalCancel) {
                         Rlog.w(TAG, "Confirmed outgoing dialog after local CANCEL without final SDP; sending BYE immediately callId=$finalInviteCallId")
                         currentCall?.let { sendByeForCall(it) }
