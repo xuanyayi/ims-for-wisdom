@@ -25,6 +25,8 @@ import java.nio.channels.Selector
 import java.nio.channels.spi.SelectorProvider
 
 /* wrapper around sockets + establish ipsec tunnel given ipsec helpers */
+private const val SIP_TCP_CONNECT_TIMEOUT_MS = 10_000
+
 interface SipConnection {
     fun close()
     fun enableIpsec(
@@ -71,7 +73,7 @@ class SipConnectionTcp(
 
     override fun connect(remotePort: Int) {
         this.remotePort = remotePort
-        socket.connect(InetSocketAddress(remoteAddr, remotePort))
+        socket.connect(InetSocketAddress(remoteAddr, remotePort), SIP_TCP_CONNECT_TIMEOUT_MS)
         if (_localAddr == null) {
             // localAddr/Port only valid after connect if no explicit bind
             localAddr = socket.localAddress

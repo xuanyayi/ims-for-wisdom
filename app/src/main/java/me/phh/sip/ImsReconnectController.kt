@@ -38,6 +38,8 @@ internal class ImsReconnectController(
         Rlog.d(tag, "Invalidated pending IMS reconnects: $reason generation=$newGeneration")
     }
 
+    fun isReconnecting(): Boolean = reconnecting.get()
+
     fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val retryNetwork = currentNetwork()
         if (retryNetwork == null) {

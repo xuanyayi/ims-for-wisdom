@@ -301,6 +301,42 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         try { if (this::serverSocketUdp.isInitialized) serverSocketUdp.socket.close() } catch (t: Throwable) { Rlog.d(TAG, "close UDP server failed", t) }
     }
 
+
+    private fun connectSipSocketWithWatchdog(
+        connection: SipConnection,
+        remotePort: Int,
+        label: String,
+        timeoutMs: Long = 10_000L,
+    ) {
+        val finished = AtomicBoolean(false)
+        var failure: Throwable? = null
+        val connectThread = thread(name = "PhhImsSocketConnect-$label") {
+            try {
+                Rlog.d(TAG, "$label SIP socket connect start remote=$pcscfAddr:$remotePort")
+                connection.connect(remotePort)
+            } catch (t: Throwable) {
+                failure = t
+            } finally {
+                finished.set(true)
+            }
+        }
+
+        connectThread.join(timeoutMs)
+        if (!finished.get()) {
+            val reason = "$label SIP socket connect timed out after ${timeoutMs}ms to $pcscfAddr:$remotePort"
+            Rlog.w(TAG, reason)
+            try {
+                connection.close()
+            } catch (t: Throwable) {
+                Rlog.d(TAG, "close timed-out $label SIP socket failed", t)
+            }
+            connectThread.join(1000L)
+            throw SocketTimeoutException(reason)
+        }
+
+        failure?.let { throw it }
+        Rlog.d(TAG, "$label SIP socket connect completed remote=$pcscfAddr:$remotePort")
+    }
     private fun dropImsConnection(reason: String) {
         clearCallAndCallbackStateForReconnect()
         closeSipTransports(reason)
@@ -319,6 +355,11 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
     }
 
     private fun shouldReconnectAfterSipTransportLoss(reason: String): Boolean {
+        if (reconnectController.isReconnecting()) {
+            Rlog.w(TAG, "Suppressing IMS reconnect for $reason because a controlled IMS reconnect is already running")
+            return false
+        }
+
         if (!this::network.isInitialized) {
             Rlog.w(TAG, "Suppressing IMS reconnect for $reason because no IMS network is initialized")
             return false
@@ -398,7 +439,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             SipConnectionUdp(network, pcscfAddr, localAddr)
         else
             SipConnectionTcp(network, pcscfAddr, localAddr)
-        plainSocket.connect(5060)
+        connectSipSocketWithWatchdog(plainSocket, 5060, "plain initial")
         socket = if(plainSocket is SipConnectionTcp)
                 SipConnectionTcp(network, pcscfAddr, plainSocket.gLocalAddr())
             else
@@ -518,7 +559,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             serverSocket.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)
             serverSocketUdp.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)
         }
-        socket.connect(portS)
+        connectSipSocketWithWatchdog(socket, portS, "IPsec authenticated")
         updateCommonHeaders(socket)
         register()
         val regReply = (
@@ -704,7 +745,12 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                                 "newPcscf=$newPcscfAddr oldTech=${registrationTechName(oldRegistrationTech)} " +
                                 "newTech=${registrationTechName(newRegistrationTech)} " +
                                 "interface=${linkProperties.interfaceName}",
-                            _network
+                            _network,
+                            delayMs = if (
+                                techChanged &&
+                                    oldRegistrationTech == REGISTRATION_TECH_IWLAN &&
+                                    newRegistrationTech == REGISTRATION_TECH_LTE
+                            ) 6_000L else 1_000L,
                         )
                     }
                 }
