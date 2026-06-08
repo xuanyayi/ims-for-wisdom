@@ -498,7 +498,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
 
     private fun hasActiveOrPendingCallForImsReconnectDeferral(): Boolean {
-        return currentCall != null || pendingOutgoingInvite != null
+        val hasDialogState = currentCall != null || pendingOutgoingInvite != null
+        val hasMediaRuntime = callStarted.get() || threadsStarted.get()
+        return hasDialogState || hasMediaRuntime
     }
 
     private fun activeOrPendingCallSummaryForReconnectDeferral(): String {
@@ -506,7 +508,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val activeCallId = active?.callHeaders?.get("call-id")?.getOrNull(0)
         val pendingCallId = pendingOutgoingInvite?.callId
         return "activeCallId=$activeCallId activeOutgoing=${active?.outgoing} " +
-            "pendingOutgoingCallId=$pendingCallId callStarted=${callStarted.get()}"
+            "pendingOutgoingCallId=$pendingCallId callStarted=${callStarted.get()} " +
+            "threadsStarted=${threadsStarted.get()} callStopped=${callStopped.get()} " +
+            "generation=${callGeneration.get()}"
     }
 
 
