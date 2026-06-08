@@ -18,6 +18,7 @@ internal class SipSmsHandler(
     private val mySipProvider: () -> String,
     private val writerProvider: () -> OutputStream,
     private val responseCallbackSetter: (String, (SipResponse) -> Boolean) -> Unit,
+    private val timeoutScheduler: (Long, () -> Unit) -> Unit,
 ) {
     var onSmsReceived: ((Int, String, ByteArray) -> Unit)? = null
     var onSmsStatusReportReceived: ((Int, String, ByteArray) -> Unit)? = null
@@ -26,9 +27,127 @@ internal class SipSmsHandler(
     private var smsToken = 0
     private val smsHeadersMap = mutableMapOf<Int, smsHeaders>()
 
+    private data class PendingOutgoingSms(
+        val callId: String,
+        val ref: Int,
+        val successCb: () -> Unit,
+        val failCb: () -> Unit,
+    )
+
+    private val pendingOutgoingSmsByCallId = mutableMapOf<String, PendingOutgoingSms>()
+    private val pendingOutgoingSmsByRef = mutableMapOf<Int, PendingOutgoingSms>()
+
+    private fun smsRefToInt(ref: Byte): Int = ref.toInt() and 0xff
+
+    private fun rememberPendingOutgoingSms(
+        callId: String,
+        ref: Int,
+        successCb: () -> Unit,
+        failCb: () -> Unit,
+    ) {
+        val pending = PendingOutgoingSms(
+            callId = callId,
+            ref = ref and 0xff,
+            successCb = successCb,
+            failCb = failCb,
+        )
+
+        smsLock.withLock {
+            pendingOutgoingSmsByCallId[callId] = pending
+            pendingOutgoingSmsByRef[pending.ref] = pending
+        }
+
+        timeoutScheduler(15_000L) {
+            val expired = smsLock.withLock {
+                pendingOutgoingSmsByCallId.remove(callId)?.also {
+                    pendingOutgoingSmsByRef.remove(it.ref)
+                }
+            }
+
+            if (expired != null) {
+                Rlog.w(
+                    tag,
+                    "Timed out waiting for RP result for outgoing SMS " +
+                        "ref=${expired.ref} callId=${expired.callId}",
+                )
+
+                try {
+                    expired.failCb()
+                } catch (t: Throwable) {
+                    Rlog.d(tag, "Failed reporting outgoing SMS RP timeout", t)
+                }
+            }
+        }
+    }
+
+    private fun removePendingOutgoingSms(request: SipRequest, sms: SipSms): PendingOutgoingSms? {
+        val inReplyTo = request.headers["in-reply-to"]?.getOrNull(0)
+        val ref = smsRefToInt(sms.ref)
+
+        return smsLock.withLock {
+            val pending = inReplyTo?.let { pendingOutgoingSmsByCallId.remove(it) }
+                ?: pendingOutgoingSmsByRef.remove(ref)
+
+            if (pending != null) {
+                pendingOutgoingSmsByCallId.remove(pending.callId)
+                pendingOutgoingSmsByRef.remove(pending.ref)
+            }
+
+            pending
+        }
+    }
+
+    private fun completePendingOutgoingSms(
+        request: SipRequest,
+        sms: SipSms,
+        success: Boolean,
+    ): Boolean {
+        val pending = removePendingOutgoingSms(request, sms) ?: return false
+
+        Rlog.d(
+            tag,
+            "Completing outgoing SMS from RP result: " +
+                "success=$success ref=${pending.ref} callId=${pending.callId}",
+        )
+
+        try {
+            if (success) {
+                pending.successCb()
+            } else {
+                pending.failCb()
+            }
+        } catch (t: Throwable) {
+            Rlog.d(tag, "Failed reporting outgoing SMS RP result", t)
+        }
+
+        return true
+    }
+
+    private fun failPendingOutgoingSmsForSipResponse(callId: String, response: SipResponse) {
+        val pending = smsLock.withLock {
+            pendingOutgoingSmsByCallId.remove(callId)?.also {
+                pendingOutgoingSmsByRef.remove(it.ref)
+            }
+        } ?: return
+
+        Rlog.w(
+            tag,
+            "Outgoing SMS SIP transaction failed before RP result: " +
+                "status=${response.statusCode} ref=${pending.ref} callId=$callId",
+        )
+
+        try {
+            pending.failCb()
+        } catch (t: Throwable) {
+            Rlog.d(tag, "Failed reporting outgoing SMS SIP failure", t)
+        }
+    }
+
     fun clearState() {
         smsLock.withLock {
             smsHeadersMap.clear()
+            pendingOutgoingSmsByCallId.clear()
+            pendingOutgoingSmsByRef.clear()
         }
     }
 
@@ -66,15 +185,19 @@ internal class SipSmsHandler(
             }
 
             SmsType.RP_ACK_FROM_NETWORK -> {
-                try {
-                    onSmsStatusReportReceived?.invoke(sms.ref.toInt(), "3gpp", ByteArray(2))
-                } catch (t: Throwable) {
-                    Rlog.d(tag, "Failed sending SMS ACK to framework", t)
+                if (!completePendingOutgoingSms(request, sms, success = true)) {
+                    try {
+                        onSmsStatusReportReceived?.invoke(smsRefToInt(sms.ref), "3gpp", ByteArray(2))
+                    } catch (t: Throwable) {
+                        Rlog.d(tag, "Failed sending SMS ACK to framework", t)
+                    }
                 }
             }
 
             SmsType.RP_ERROR_FROM_NETWORK -> {
-                Rlog.d(tag, "SMS error from network")
+                if (!completePendingOutgoingSms(request, sms, success = false)) {
+                    Rlog.d(tag, "SMS error from network without matching pending outgoing SMS")
+                }
             }
 
             else -> return 500
@@ -149,13 +272,27 @@ internal class SipSmsHandler(
             data,
         )
 
-        responseCallbackSetter(msg.headers["call-id"]!![0]) { resp: SipResponse ->
-            if (resp.statusCode == 200 || resp.statusCode == 202) {
-                successCb()
-            } else {
-                failCb()
+        val callId = msg.headers["call-id"]!![0]
+        rememberPendingOutgoingSms(callId, ref, successCb, failCb)
+
+        responseCallbackSetter(callId) { resp: SipResponse ->
+            when {
+                resp.statusCode == 200 || resp.statusCode == 202 -> {
+                    Rlog.d(
+                        tag,
+                        "Outgoing SMS SIP MESSAGE accepted; waiting for RP result " +
+                            "ref=${ref and 0xff} callId=$callId status=${resp.statusCode}",
+                    )
+                    true
+                }
+
+                resp.statusCode < 200 -> false
+
+                else -> {
+                    failPendingOutgoingSmsForSipResponse(callId, resp)
+                    true
+                }
             }
-            true
         }
 
         Rlog.d(tag, "Sending $msg")

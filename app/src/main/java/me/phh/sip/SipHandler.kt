@@ -181,6 +181,7 @@ private val smsHandler = SipSmsHandler(
         mySipProvider = { mySip },
         writerProvider = { socket.gWriter() },
         responseCallbackSetter = { callId, cb -> setResponseCallback(callId, cb) },
+        timeoutScheduler = { delayMs, action -> myHandler.postDelayed({ action() }, delayMs) },
     )
 
     var onSmsReceived: ((Int, String, ByteArray) -> Unit)?
