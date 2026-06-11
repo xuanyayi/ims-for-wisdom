@@ -98,6 +98,89 @@ class PhhMmTelFeature(
     val slotId: Int,
     initialSubId: Int = SubscriptionManager.INVALID_SUBSCRIPTION_ID,
 ) : PhhMmTelFeatureProtected(slotId) {
+
+    // MMTEL capabilities are configured independently per registration technology.
+    private val enabledMmTelCapabilitiesByRadioTech = mutableMapOf<Int, Int>()
+
+    private fun recomputeEnabledMmTelCapabilitiesLocked(): Int {
+        var result = 0
+        for (caps in enabledMmTelCapabilitiesByRadioTech.values) {
+            result = result or caps
+        }
+        return result
+    }
+
+    private fun setMmTelCapabilityForRadioTech(capability: Int, radioTech: Int, enabled: Boolean) {
+        synchronized(enabledMmTelCapabilitiesByRadioTech) {
+            val oldCaps = enabledMmTelCapabilitiesByRadioTech[radioTech] ?: 0
+            val newCaps = if (enabled) {
+                oldCaps or capability
+            } else {
+                oldCaps and capability.inv()
+            }
+            if (newCaps == 0) {
+                enabledMmTelCapabilitiesByRadioTech.remove(radioTech)
+            } else {
+                enabledMmTelCapabilitiesByRadioTech[radioTech] = newCaps
+            }
+        }
+    }
+
+    private fun notifyEnabledMmTelCapabilitiesChanged() {
+        val finalCapabilities = synchronized(enabledMmTelCapabilitiesByRadioTech) {
+            recomputeEnabledMmTelCapabilitiesLocked()
+        }
+        Rlog.i(
+            TAG,
+            "Final MMTEL capabilities=$finalCapabilities perTech=$enabledMmTelCapabilitiesByRadioTech"
+        )
+        notifyCapabilitiesStatusChanged(
+            android.telephony.ims.feature.MmTelFeature.MmTelCapabilities(finalCapabilities)
+        )
+    }
+
+    protected override fun onChangeEnabledCapabilities(
+        request: android.telephony.ims.feature.CapabilityChangeRequest,
+        callback: PhhMmTelFeatureProtected.CapabilityChangeCallback
+    ) {
+        for (pair in request.capabilitiesToEnable) {
+            Rlog.i(
+                TAG,
+                "Enabling MMTEL capability=${pair.capability} radioTech=${pair.radioTech}"
+            )
+            setMmTelCapabilityForRadioTech(pair.capability, pair.radioTech, true)
+            callback.onChangeCapabilityConfigurationError(
+                pair.capability,
+                pair.radioTech,
+                android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS
+            )
+        }
+        for (pair in request.capabilitiesToDisable) {
+            Rlog.i(
+                TAG,
+                "Disabling MMTEL capability=${pair.capability} radioTech=${pair.radioTech}"
+            )
+            setMmTelCapabilityForRadioTech(pair.capability, pair.radioTech, false)
+            callback.onChangeCapabilityConfigurationError(
+                pair.capability,
+                pair.radioTech,
+                android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS
+            )
+        }
+        notifyEnabledMmTelCapabilitiesChanged()
+    }
+
+    override fun queryCapabilityConfiguration(capability: Int, radioTech: Int): Boolean {
+        val enabled = synchronized(enabledMmTelCapabilitiesByRadioTech) {
+            ((enabledMmTelCapabilitiesByRadioTech[radioTech] ?: 0) and capability) != 0
+        }
+        Rlog.d(
+            TAG,
+            "queryCapabilityConfiguration capability=$capability radioTech=$radioTech enabled=$enabled perTech=$enabledMmTelCapabilitiesByRadioTech"
+        )
+        return enabled
+    }
+
     companion object {
         private const val TAG = "PHH MmTelFeature"
     }
@@ -740,10 +823,6 @@ sipHandler.imsFailureCallback = {
     }
 
     // ints are @MmTelCapabilities.MmTelCapability and @ImsRegistrationImplBase.ImsRegistrationTech
-    override fun queryCapabilityConfiguration(capability: Int, radioTech: Int): Boolean {
-        Rlog.d(TAG, "$slotId queryCapabilityConfiguration $capability $radioTech")
-        return capability == MmTelCapabilities.CAPABILITY_TYPE_SMS || capability == MmTelCapabilities.CAPABILITY_TYPE_VOICE
-    }
 
     override fun setUiTtyMode(mode: Int, onCompleteMessage: Message?) {
         Rlog.d(TAG, "$slotId setUiTtyMode $onCompleteMessage")

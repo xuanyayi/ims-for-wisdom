@@ -13,6 +13,11 @@ import java.util.List;
 // changeEnabledCapabilities which cannot be done in kotlin
 // see https://stackoverflow.com/questions/49284094/inheritance-from-java-class-with-a-public-method-accepting-a-protected-class-in/49287402#49287402
 public class PhhMmTelFeatureProtected extends MmTelFeature {
+
+    public interface CapabilityChangeCallback {
+        void onChangeCapabilityConfigurationError(int capability, int radioTech, int reason);
+    }
+
 	private final static String TAG = "Phh MmTelFeatureProtected";
 	private int slotId;
 	private int capabilities;
@@ -27,33 +32,36 @@ public class PhhMmTelFeatureProtected extends MmTelFeature {
 			MmTelCapabilities.CAPABILITY_TYPE_SMS;
 	}
 
-	public void changeEnabledCapabilities(CapabilityChangeRequest capabilityChangeRequest,
-			ImsFeature.CapabilityCallbackProxy capabilityCallbackProxy) {
-		Rlog.d(TAG, slotId + " changeEnabledCapabilities");
-
-		List<CapabilityChangeRequest.CapabilityPair> toEnable =
-			capabilityChangeRequest.getCapabilitiesToEnable();
-		toEnable.forEach((pair) -> {
-			int cap = pair.getCapability();
-			Rlog.d(TAG, "Adding " + cap + " to " + pair.getRadioTech());
-			if(pair.getRadioTech() == ImsRegistrationImplBase.REGISTRATION_TECH_LTE) {
-				this.capabilities |= cap;
-			}
-		});
-
-		List<CapabilityChangeRequest.CapabilityPair> toDisable =
-			capabilityChangeRequest.getCapabilitiesToDisable();
-		toDisable.forEach((pair) -> {
-			int cap = pair.getCapability();
-			Rlog.d(TAG, "Removing " + cap + " to " + pair.getRadioTech());
-			if(pair.getRadioTech() == ImsRegistrationImplBase.REGISTRATION_TECH_LTE) {
-				this.capabilities &= ~cap;
-			}
-		});
-		Rlog.d(TAG, "Final capabilities: " + this.capabilities);
-
-		MmTelFeature.MmTelCapabilities capabilities = new MmTelFeature.MmTelCapabilities();
-		capabilities.addCapabilities(this.capabilities);
-		notifyCapabilitiesStatusChanged(capabilities);
+	@Override
+	public void changeEnabledCapabilities(
+	        android.telephony.ims.feature.CapabilityChangeRequest request,
+	        android.telephony.ims.feature.ImsFeature.CapabilityCallbackProxy callback) {
+	    onChangeEnabledCapabilities(request, new CapabilityChangeCallback() {
+	        @Override
+	        public void onChangeCapabilityConfigurationError(int capability, int radioTech, int reason) {
+	            callback.onChangeCapabilityConfigurationError(capability, radioTech, reason);
+	        }
+	    });
 	}
+
+	protected void onChangeEnabledCapabilities(
+	        android.telephony.ims.feature.CapabilityChangeRequest request,
+	        CapabilityChangeCallback callback) {
+	    for (android.telephony.ims.feature.CapabilityChangeRequest.CapabilityPair pair :
+	            request.getCapabilitiesToEnable()) {
+	        callback.onChangeCapabilityConfigurationError(
+	                pair.getCapability(),
+	                pair.getRadioTech(),
+	                android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS);
+	    }
+	    for (android.telephony.ims.feature.CapabilityChangeRequest.CapabilityPair pair :
+	            request.getCapabilitiesToDisable()) {
+	        callback.onChangeCapabilityConfigurationError(
+	                pair.getCapability(),
+	                pair.getRadioTech(),
+	                android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS);
+	    }
+	}
+
+
 }
