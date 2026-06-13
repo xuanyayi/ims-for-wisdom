@@ -4386,7 +4386,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         isPrecondition: Boolean,
         respSdp: List<String>,
-        originalInviteSdp: ByteArray,
         fallbackTarget: String,
     ): Boolean? {
         if (!isPrecondition || response.statusCode != 183) return null
@@ -4406,8 +4405,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             }
 
             val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
-                originalInviteSdp = originalInviteSdp,
                 respSdp = respSdp,
+                call = currentCall!!,
                 remoteHasLocalQos = remoteHasLocalQos,
                 nextLocalSdpVersion = { currentCall?.localSdpVersion?.incrementAndGet() ?: 3 },
             )
@@ -4465,7 +4464,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         dtmfNbTrack: Int,
         outgoingDialogNextCseq: AtomicInteger,
         myHeaders: Map<String, List<String>>,
-        originalInviteSdp: ByteArray,
         fallbackTarget: String,
     ): Boolean {
         val outgoingDialogSdpAnswer = parseOutgoingDialogSdpAnswer(
@@ -4499,7 +4497,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             response = response,
             isPrecondition = isPrecondition,
             respSdp = respSdp,
-            originalInviteSdp = originalInviteSdp,
             fallbackTarget = fallbackTarget,
         )?.let { return it }
 
@@ -4572,7 +4569,6 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             dtmfNbTrack = dtmfNbTrack,
             outgoingDialogNextCseq = outgoingDialogNextCseq,
             myHeaders = myHeaders,
-            originalInviteSdp = sdp,
             fallbackTarget = to,
         )
     }

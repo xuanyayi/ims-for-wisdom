@@ -176,37 +176,59 @@ internal object SipOutgoingDialogSdp {
     }
 
     fun buildPreconditionUpdateSdp(
-        originalInviteSdp: ByteArray,
         respSdp: List<String>,
+        call: SipHandler.Call,
         remoteHasLocalQos: Boolean,
         nextLocalSdpVersion: () -> Int,
     ): ByteArray {
-        val remoteMaxptimeLine = respSdp.firstOrNull { it.startsWith("a=maxptime:") } ?: "a=maxptime:40"
+        val localAddr = call.rtpSocket.localAddress
+        val ipType = if (localAddr is java.net.Inet6Address) "IP6" else "IP4"
+        val localHost = localAddr.hostAddress
+        val sdpVersion = nextLocalSdpVersion()
+        val remoteMaxptimeLine = respSdp.firstOrNull { it.startsWith("a=maxptime:") } ?: "a=maxptime:240"
+        val remotePtimeLine = respSdp.firstOrNull { it.startsWith("a=ptime:") } ?: "a=ptime:20"
+        val amrFmtpLine = respSdp.firstOrNull { it.startsWith("a=fmtp:${call.amrTrack}") }
+            ?: "a=${SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(call.amrTrack, call.audioCodec)}"
+        val dtmfFmtpLine = respSdp.firstOrNull { it.startsWith("a=fmtp:${call.dtmfTrack}") }
+            ?: "a=fmtp:${call.dtmfTrack} 0-15"
+        val sdpBandwidthAs = SipAudioCodecNegotiator.sdpBandwidthAsKbps(call.audioCodec)
+        val desiredLocalQos = respSdp
+            .firstOrNull { it.startsWith("a=des:qos", ignoreCase = true) && it.contains(" local ", ignoreCase = true) }
+            ?.substringAfter("a=des:qos ")
+            ?: "mandatory local sendrecv"
+        val desiredRemoteQos = respSdp
+            .firstOrNull { it.startsWith("a=des:qos", ignoreCase = true) && it.contains(" remote ", ignoreCase = true) }
+            ?.substringAfter("a=des:qos ")
+            ?: "mandatory remote sendrecv"
 
-        val localUpdateSdpLines = originalInviteSdp.toString(Charsets.UTF_8)
-            .split("[\r\n]+".toRegex())
-            .filter { it.isNotBlank() }
-            .map { line ->
-                when {
-                    line.startsWith("o=") -> {
-                        val v = nextLocalSdpVersion()
-                        line.replace(Regex("^(o=\\S+\\s+\\S+\\s+)\\S+(\\s+IN\\s+IP[46]\\s+.*)$"), "$1$v$2")
-                    }
-                    line.startsWith("a=maxptime:") -> remoteMaxptimeLine
-                    line.startsWith("a=curr:qos local") -> "a=curr:qos local sendrecv"
-                    line.startsWith("a=curr:qos remote") -> if (remoteHasLocalQos) "a=curr:qos remote sendrecv" else "a=curr:qos remote none"
-                    else -> line
-                }
-            }
-            .let { lines ->
-                if (lines.any { it.startsWith("a=conf:qos remote") }) {
-                    lines
-                } else {
-                    lines + "a=conf:qos remote sendrecv"
-                }
-            }
+        val localUpdateSdpLines = listOf(
+            "v=0",
+            "o=- 1 $sdpVersion IN $ipType $localHost",
+            "s=phh voice call",
+            "c=IN $ipType $localHost",
+            "b=AS:$sdpBandwidthAs",
+            "b=RS:0",
+            "b=RR:0",
+            "t=0 0",
+            "m=audio ${call.rtpSocket.localPort} RTP/AVP ${call.amrTrack} ${call.dtmfTrack}",
+            "b=AS:$sdpBandwidthAs",
+            "b=RS:0",
+            "b=RR:0",
+            "a=${call.amrTrackDesc}",
+            remotePtimeLine,
+            remoteMaxptimeLine,
+            "a=${call.dtmfTrackDesc}",
+            amrFmtpLine,
+            dtmfFmtpLine,
+            "a=curr:qos local sendrecv",
+            "a=curr:qos remote ${if (remoteHasLocalQos) "sendrecv" else "none"}",
+            "a=des:qos $desiredLocalQos",
+            "a=des:qos $desiredRemoteQos",
+            "a=conf:qos remote sendrecv",
+            "a=sendrecv",
+        )
 
-        return localUpdateSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+        return (localUpdateSdpLines.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
     }
 
 
