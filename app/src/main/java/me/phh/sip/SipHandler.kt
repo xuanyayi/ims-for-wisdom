@@ -6247,7 +6247,6 @@ fun onWfcDisabled(reason: String) {
         response: SipResponse,
         isPrecondition: Boolean,
         respSdp: List<String>,
-        originalInviteSdp: ByteArray,
         fallbackTarget: String,
     ): Boolean? {
         if (!isPrecondition || response.statusCode != 183) return null
@@ -6267,8 +6266,8 @@ fun onWfcDisabled(reason: String) {
             }
 
             val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
-                originalInviteSdp = originalInviteSdp,
                 respSdp = respSdp,
+                call = currentCall!!,
                 remoteHasLocalQos = remoteHasLocalQos,
                 nextLocalSdpVersion = { currentCall?.localSdpVersion?.incrementAndGet() ?: 3 },
             )
@@ -6334,7 +6333,6 @@ fun onWfcDisabled(reason: String) {
         dtmfNbTrack: Int,
         outgoingDialogNextCseq: AtomicInteger,
         myHeaders: Map<String, List<String>>,
-        originalInviteSdp: ByteArray,
         fallbackTarget: String,
     ): Boolean {
         val outgoingDialogSdpAnswer = parseOutgoingDialogSdpAnswer(
@@ -6368,7 +6366,6 @@ fun onWfcDisabled(reason: String) {
             response = response,
             isPrecondition = isPrecondition,
             respSdp = respSdp,
-            originalInviteSdp = originalInviteSdp,
             fallbackTarget = fallbackTarget,
         )?.let { return it }
 
@@ -6443,7 +6440,6 @@ fun onWfcDisabled(reason: String) {
             dtmfNbTrack = dtmfNbTrack,
             outgoingDialogNextCseq = outgoingDialogNextCseq,
             myHeaders = myHeaders,
-            originalInviteSdp = sdp,
             fallbackTarget = to,
         )
     }
