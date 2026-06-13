@@ -54,7 +54,7 @@ internal object SipUpdateResponseBuilder {
                 k in listOf("cseq", "via", "from", "to", "call-id")
             } + """
                 Content-Type: application/sdp
-                Supported: 100rel, replaces, timer
+                Supported: 100rel, replaces, timer, precondition
                 Require: precondition
                 Call-ID: $callId
             """.toSipHeadersMap(),
