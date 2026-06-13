@@ -41,7 +41,7 @@ internal object SipUpdateResponseBuilder {
             headersParam = request.headers.filter { (k, _) ->
                 k in listOf("cseq", "via", "from", "to", "call-id")
             } + """
-                Supported: 100rel, replaces, timer
+                Supported: 100rel, replaces, timer, precondition
                 Call-ID: $requestCallId
                 Content-Length: 0
             """.toSipHeadersMap() +
