@@ -854,13 +854,13 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         )
 
         val iwlanReady =
-            iwlanRegistration?.isNetworkRegistered == true &&
+            iwlanRegistration?.isRegistered == true &&
                 iwlanRegistration.accessNetworkTechnology == TelephonyManager.NETWORK_TYPE_IWLAN
 
         Rlog.d(
             TAG,
             "WFC Wi-Fi preferred IWLAN readiness: ready=$iwlanReady " +
-                "reg=${iwlanRegistration?.networkRegistrationState} " +
+                "reg=${iwlanRegistration?.registrationState} " +
                 "rat=${iwlanRegistration?.accessNetworkTechnology}",
         )
         return iwlanReady
@@ -2127,7 +2127,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             null
         } ?: return false
 
-        return iwlanInfo.isNetworkRegistered &&
+        return iwlanInfo.isRegistered &&
             iwlanInfo.accessNetworkTechnology == TelephonyManager.NETWORK_TYPE_IWLAN
     }
 

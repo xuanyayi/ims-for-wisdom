@@ -57,7 +57,7 @@ private fun ServiceState.phhIwlanRegistrationForIms(): NetworkRegistrationInfo? 
 private fun ServiceState.isIwlanReadyForPhhIms(): Boolean {
     val iwlanRegistration = phhIwlanRegistrationForIms() ?: return false
 
-    val iwlanRegistered = iwlanRegistration.isNetworkRegistered
+    val iwlanRegistered = iwlanRegistration.isRegistered
 
     val iwlanRat =
         iwlanRegistration.accessNetworkTechnology == TelephonyManager.NETWORK_TYPE_IWLAN
@@ -90,7 +90,7 @@ private fun ServiceState.phhImsReadyDebug(
     val iwlanRegistration = phhIwlanRegistrationForIms()
 
     return "state=$state registeredPlmn=$registeredPlmn " +
-        "iwlanReg=${iwlanRegistration?.networkRegistrationState} " +
+        "iwlanReg=${iwlanRegistration?.registrationState} " +
         "iwlanRat=${iwlanRegistration?.accessNetworkTechnology}"
 }
 
@@ -250,7 +250,9 @@ class PhhMmTelFeature(
             return activeSubId
         }
 
-        val frameworkSlotSubId = SubscriptionManager.getSubscriptionId(slotId)
+        val frameworkSlotSubId = subscriptionManager.getSubscriptionIds(slotId)
+            ?.firstOrNull()
+            ?: SubscriptionManager.INVALID_SUBSCRIPTION_ID
         if (SubscriptionManager.isValidSubscriptionId(frameworkSlotSubId)) {
             return frameworkSlotSubId
         }
@@ -790,12 +792,7 @@ sipHandler.imsFailureCallback = {
                 }
 
             }
-            val frameworkCallListener = notifyIncomingCall(incomingSession, incomingSession.getCallId(), Bundle())
-            if (frameworkCallListener != null) {
-                incomingSession.setListener(frameworkCallListener)
-            } else {
-                Rlog.w(TAG, "Framework rejected incoming IMS call ${incomingSession.getCallId()}")
-            }
+            notifyIncomingCall(incomingSession, Bundle())
         }
         sipHandler.onCancelledCall = { param: Object, reason: String, map: Map<String, String> ->
     Rlog.d(TAG, "Cancelling call")
