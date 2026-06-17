@@ -179,6 +179,7 @@ internal object SipOutgoingDialogSdp {
         respSdp: List<String>,
         call: SipHandler.Call,
         remoteHasLocalQos: Boolean,
+        compactChinaUnicom: Boolean = false,
         nextLocalSdpVersion: () -> Int,
     ): ByteArray {
         val localAddr = call.rtpSocket.localAddress
@@ -201,7 +202,25 @@ internal object SipOutgoingDialogSdp {
             ?.substringAfter("a=des:qos ")
             ?: "mandatory remote sendrecv"
 
-        val localUpdateSdpLines = listOf(
+        val localUpdateSdpLines = if (compactChinaUnicom) {
+            listOf(
+                "v=0",
+                "o=- 1 $sdpVersion IN $ipType $localHost",
+                "s=-",
+                "c=IN $ipType $localHost",
+                "t=0 0",
+                "m=audio ${call.rtpSocket.localPort} RTP/AVP ${call.amrTrack}",
+                "a=${call.amrTrackDesc}",
+                amrFmtpLine,
+                remotePtimeLine,
+                "a=curr:qos local sendrecv",
+                "a=curr:qos remote ${if (remoteHasLocalQos) "sendrecv" else "none"}",
+                "a=des:qos $desiredLocalQos",
+                "a=des:qos $desiredRemoteQos",
+                "a=conf:qos remote sendrecv",
+                "a=sendrecv",
+            )
+        } else listOf(
             "v=0",
             "o=- 1 $sdpVersion IN $ipType $localHost",
             "s=phh voice call",

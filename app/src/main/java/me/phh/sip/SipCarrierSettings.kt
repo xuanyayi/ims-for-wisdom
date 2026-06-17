@@ -6,6 +6,7 @@ data class SipCarrierSettings(
     val mnc: String,
     val isControlSocketUdp: Boolean,
     val requireNonsessAka: Boolean,
+    val fixedSipServerPort: Int? = null,
 ) {
     companion object {
         fun fromSimOperator(simOperator: String): SipCarrierSettings {
@@ -17,6 +18,7 @@ data class SipCarrierSettings(
                 mcc = mcc,
                 mnc = mnc,
                 isControlSocketUdp = when (mccMnc) {
+                    "460001" -> true // China Unicom stock Samsung profile is udp-preferred
                     "450006" -> true // LG U+ can only do UDP
                     "208010" -> true // 20810 can do TCP and UDP. use this for testing
                     else -> false
@@ -25,6 +27,10 @@ data class SipCarrierSettings(
                 requireNonsessAka = when (mccMnc) {
                     "450006" -> true
                     else -> false
+                },
+                fixedSipServerPort = when (mccMnc) {
+                    "460001" -> 6100
+                    else -> null
                 },
             )
         }

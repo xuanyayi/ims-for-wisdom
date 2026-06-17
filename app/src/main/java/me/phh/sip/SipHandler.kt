@@ -34,6 +34,8 @@ class SipHandler(
         private const val RTP_SOCKET_RECEIVE_TIMEOUT_MS = 20
 
         private const val INCOMING_ACCEPT_IMS_ACCESS_CHANGE_GUARD_MS = 1_200L
+        private const val REGISTER_REFRESH_RESPONSE_TIMEOUT_MS = 15_000L
+        private const val REGISTER_MAX_AGE_FOR_OUTGOING_CALL_MS = 115L * 60L * 1000L
     }
 
     val myHandler = Handler(HandlerThread("PhhMmTelFeature").apply { start() }.looper)
@@ -95,6 +97,13 @@ class SipHandler(
     private val carrierSettings = SipCarrierSettings.fromSimOperator(homeOperatorForIms)
     private val mcc = carrierSettings.mcc
     private val mnc = carrierSettings.mnc
+    private val mncDiscoveryCandidates = buildList {
+        add(mnc)
+        add(homeOperatorForIms.substring(3))
+    }
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
     private val imsi = subTelephonyManager.subscriberId
 
     // dual-SIM IMS context logging.
@@ -220,6 +229,7 @@ class SipHandler(
     private inner class UdpSipResponseWriter(
         private val remoteAddress: InetAddress,
         private val remotePort: Int,
+        private val logLabel: String = "response",
     ) : OutputStream() {
         private val pendingSingleByteWrites = ByteArrayOutputStream()
 
@@ -261,7 +271,7 @@ class SipHandler(
                 if (sent != bytes.size) {
                     Rlog.w(
                         TAG,
-                        "UDP SIP response partial send bytes=$sent expected=${bytes.size} " +
+                        "UDP SIP $logLabel partial send bytes=$sent expected=${bytes.size} " +
                             "target=$remoteAddress:$remotePort firstLine=$firstLine",
                     )
                 }
@@ -276,7 +286,7 @@ class SipHandler(
 
             Rlog.d(
                 TAG,
-                "UDP SIP response sent bytes=${bytes.size} " +
+                "UDP SIP $logLabel sent bytes=${bytes.size} " +
                     "target=$remoteAddress:$remotePort firstLine=$firstLine",
             )
         }
@@ -313,6 +323,9 @@ class SipHandler(
     var imsFailureCallback: (() -> Unit)? = null
     var imsRegisteringCallback: ((Int) -> Unit)? = null
     private var imsRegistrationTech = REGISTRATION_TECH_LTE
+    private val registerRefreshGeneration = AtomicInteger(0)
+    @Volatile
+    private var lastRegisterOkUptimeMs = 0L
     private var pendingCellularReconnectAfterWfcDisable = false
     private var pendingImsReconnectAfterActiveCallReason: String? = null
     @Volatile
@@ -569,6 +582,10 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
             return false
         }
 
+        if (!isRegisterFreshForOutgoingCall()) {
+            return false
+        }
+
         if (isWaitingForPreferredImsAccessAfterWfcPreferenceChange()) {
             val elapsedMs = android.os.SystemClock.uptimeMillis() - wfcSubscriptionSettingMonitor.lastChangeUptimeMs()
             val preferredAccess =
@@ -656,6 +673,8 @@ fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
     }
 
     private fun resetRegistrationStateForConnect() {
+        registerRefreshGeneration.incrementAndGet()
+        lastRegisterOkUptimeMs = 0L
         registerCounter = 1
         akaDigest = initialRegisterAuthorization()
         val registerCallId = generateCallId()
@@ -1050,6 +1069,53 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         reconnectController.reconnectIms(reason, newNetwork, delayMs)
     }
 
+    private fun isRegisterFreshForOutgoingCall(): Boolean {
+        val lastOk = lastRegisterOkUptimeMs
+        if (lastOk <= 0L) return true
+
+        val ageMs = SystemClock.uptimeMillis() - lastOk
+        if (ageMs <= REGISTER_MAX_AGE_FOR_OUTGOING_CALL_MS) {
+            return true
+        }
+
+        Rlog.w(
+            TAG,
+            "Rejecting outgoing call while IMS REGISTER is stale; " +
+                "lastRegisterOkAgeMs=$ageMs maxAgeMs=$REGISTER_MAX_AGE_FOR_OUTGOING_CALL_MS",
+        )
+        reconnectIms("outgoing call attempted with stale IMS REGISTER ageMs=$ageMs", delayMs = 0L)
+        return false
+    }
+
+    private fun scheduleRegisterRefreshResponseWatchdog(
+        generation: Int,
+        cseq: Int,
+        sentUptimeMs: Long,
+    ) {
+        myHandler.postDelayed({
+            if (generation != registerRefreshGeneration.get()) {
+                return@postDelayed
+            }
+
+            if (!imsReady) {
+                return@postDelayed
+            }
+
+            val elapsedMs = SystemClock.uptimeMillis() - sentUptimeMs
+            val lastOkAgeMs =
+                lastRegisterOkUptimeMs
+                    .takeIf { it > 0L }
+                    ?.let { SystemClock.uptimeMillis() - it }
+                    ?: -1L
+            Rlog.w(
+                TAG,
+                "Periodic REGISTER cseq=$cseq did not receive 200 OK within ${elapsedMs}ms; " +
+                    "lastRegisterOkAgeMs=$lastOkAgeMs, reconnecting IMS",
+            )
+            reconnectIms("periodic REGISTER cseq=$cseq did not receive 200 OK", delayMs = 0L)
+        }, REGISTER_REFRESH_RESPONSE_TIMEOUT_MS)
+    }
+
 
     private fun restartOutgoingMediaAfterDialogSdpCodecChange(
         oldCall: Call?,
@@ -1274,7 +1340,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         Rlog.d(TAG, "IMS registration tech ${registrationTechName(imsRegistrationTech)} interface=${lp.interfaceName} caps=${connectivityManager.getNetworkCapabilities(network)}")
         warnIfCurrentCellularImsEndpointDoesNotMatchWfcPolicy(lp)
         imsRegisteringCallback?.invoke(imsRegistrationTech)
-        when (val endpoint = ImsNetworkState.resolveEndpoint(TAG, lp, mnc, mcc)) {
+        when (
+            val endpoint = ImsNetworkState.resolveEndpoint(
+                TAG,
+                network,
+                lp,
+                mnc,
+                mcc,
+                mncDiscoveryCandidates,
+                readIsimPcscfCandidates(),
+                isControlSocketUdp,
+            )
+        ) {
             is ImsNetworkEndpointResolution.Success -> {
                 localAddr = endpoint.localAddr
                 pcscfAddr = endpoint.pcscfAddr
@@ -1294,8 +1371,26 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         return true
     }
 
+    private fun readIsimPcscfCandidates(): List<String> {
+        val candidates = try {
+            subTelephonyManager.getIsimPcscf()
+        } catch (t: Throwable) {
+            Rlog.w(TAG, "Unable to read ISIM P-CSCF candidates ${imsDualSimDebugContext()}", t)
+            null
+        }
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.distinct()
+            ?: emptyList()
+
+        Rlog.d(TAG, "ISIM P-CSCF candidates count=${candidates.size} ${imsDualSimDebugContext()}")
+        return candidates
+    }
+
 
     private fun setupPlainSipSocketsAndSendInitialRegister() {
+        val fixedSipServerPort = carrierSettings.fixedSipServerPort?.takeIf { isControlSocketUdp }
+        val protectedClientPort = fixedSipServerPort?.let { it - 1 } ?: 0
         plainSocket = if (isControlSocketUdp)
             SipConnectionUdp(network, pcscfAddr, localAddr)
         else
@@ -1304,15 +1399,33 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         socket = if (plainSocket is SipConnectionTcp)
                 SipConnectionTcp(network, pcscfAddr, plainSocket.gLocalAddr())
             else
-                SipConnectionUdp(network, pcscfAddr, plainSocket.gLocalAddr())
+                SipConnectionUdp(network, pcscfAddr, plainSocket.gLocalAddr(), protectedClientPort)
+        val serverPort = fixedSipServerPort ?: socket.gLocalPort() + 1
         serverSocket =
-            SipConnectionTcpServer(network, pcscfAddr, plainSocket.gLocalAddr(), socket.gLocalPort() + 1)
+            SipConnectionTcpServer(network, pcscfAddr, plainSocket.gLocalAddr(), serverPort)
         serverSocketUdp =
-            SipConnectionUdpServer(network, pcscfAddr, plainSocket.gLocalAddr(), socket.gLocalPort() + 1)
+            SipConnectionUdpServer(network, pcscfAddr, plainSocket.gLocalAddr(), serverPort)
 
-        Rlog.d(TAG, "SIP ports ${imsDualSimDebugContext("src=${socket.gLocalPort()} tcpServer=${serverSocket.localPort} udpServer=${serverSocketUdp.localPort}")}")
+        val fixedServerLabel = fixedSipServerPort?.toString() ?: "none"
+        Rlog.d(
+            TAG,
+            "SIP ports ${imsDualSimDebugContext(
+                "plainSrc=${plainSocket.gLocalPort()} src=${socket.gLocalPort()} tcpServer=${serverSocket.localPort} udpServer=${serverSocketUdp.localPort} fixedServer=$fixedServerLabel"
+            )}"
+        )
         updateCommonHeaders(plainSocket)
-        register(plainSocket.gWriter())
+        val initialRegisterWriter =
+            if (fixedSipServerPort != null && isControlSocketUdp) {
+                Rlog.w(
+                    TAG,
+                    "Sending initial SIP REGISTER from fixed UDP server port " +
+                        "${serverSocketUdp.localPort} to $pcscfAddr:5060 ${imsDualSimDebugContext()}",
+                )
+                UdpSipResponseWriter(pcscfAddr, 5060, "initial REGISTER")
+            } else {
+                plainSocket.gWriter()
+            }
+        register(initialRegisterWriter)
     }
 
 
@@ -2198,9 +2311,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             return
         }
         logWfcImsRequestPolicyIfNeeded()
+        val useDefaultDataBearer = ImsNetworkRequestBuilder.useDefaultDataBearer()
         val imsNetworkRequest = ImsNetworkRequestBuilder.buildForSubscription(subId)
 
-        Rlog.d(TAG, "Built subscription-specific IMS network request ${imsDualSimDebugContext("transport=CELLULAR request=$imsNetworkRequest")}")
+        Rlog.d(
+            TAG,
+            "Built subscription-specific IMS network request " +
+                imsDualSimDebugContext(
+                    "transport=CELLULAR " +
+                        "bearer=${if (useDefaultDataBearer) "default-data" else "ims-apn"} " +
+                        "request=$imsNetworkRequest",
+                ),
+        )
 
         unregisterImsNetworkCallback("new IMS network request")
 
@@ -2224,7 +2346,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     }
 
 
-    private fun useSingTelNullSha1SecurityOffer(): Boolean =
+    private fun useCompactNullSha1SecurityOffer(): Boolean =
+        (mcc == "460" && mnc == "001") ||
         realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
             registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
 
@@ -2239,6 +2362,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         // XXX timeout/retry? notification on fail? receive on thread?
 
         val writer = _writer ?: socket.gWriter()
+        val isPeriodicRefresh = imsReady && _writer == null
+        val refreshGeneration =
+            if (isPeriodicRefresh) registerRefreshGeneration.incrementAndGet() else -1
+        val sentUptimeMs = SystemClock.uptimeMillis()
+        val sentCseq = registerCounter
 
         val msg = SipRegisterRequestBuilder.build(
             realm = registerTargetRealm,
@@ -2250,8 +2378,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             clientPort = socket.gLocalPort(),
             serverPort = serverSocket.localPort,
             securityClientOverride = registerSecurityClientOverride,
-            securityClientAlgs = if (useSingTelNullSha1SecurityOffer()) listOf("hmac-sha-1-96") else listOf("hmac-sha-1-96", "hmac-md5-96"),
-            securityClientEalgs = if (useSingTelNullSha1SecurityOffer()) listOf("null") else listOf("null", "aes-cbc"),
+            securityClientAlgs = if (useCompactNullSha1SecurityOffer()) listOf("hmac-sha-1-96") else listOf("hmac-sha-1-96", "hmac-md5-96"),
+            securityClientEalgs = if (useCompactNullSha1SecurityOffer()) listOf("null") else listOf("null", "aes-cbc"),
             stripSecurityVerifyQ = false,
             useSelectedSecurityClient = registerTargetRealm != realm,
             forceSecurityAgreementNullEalg = false,
@@ -2262,12 +2390,22 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             writer.flush()
         }
         registerCounter += 1
+
+        if (isPeriodicRefresh) {
+            scheduleRegisterRefreshResponseWatchdog(refreshGeneration, sentCseq, sentUptimeMs)
+        }
     }
 
     fun registerCallback(response: SipResponse): Boolean {
         // once we get there all register must be successful
         // on failure just abort thread, ims will restart
         require(response.statusCode == 200)
+
+        val now = SystemClock.uptimeMillis()
+        lastRegisterOkUptimeMs = now
+        registerRefreshGeneration.incrementAndGet()
+        val cseq = sipHeaderValues(response, "cseq").joinToString(" ")
+        Rlog.d(TAG, "REGISTER 200 OK acknowledged cseq=$cseq uptimeMs=$now")
 
         val registeredIdentity = SipRegisterSuccessParser.parse(response)
         mySip = registeredIdentity.mySip
@@ -2321,6 +2459,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             commonHeaders = commonHeaders,
             contact = contact,
         )
+
+    private fun compactChinaUnicomContact(): String {
+        val localEndpoint =
+            if (socket.gLocalAddr() is Inet6Address) {
+                "[${socket.gLocalAddr().hostAddress}]:${serverSocket.localPort}"
+            } else {
+                "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
+            }
+        return "<sip:$imsi@$localEndpoint;transport=${SipContactHeaders.transport(socket)}>"
+    }
+
+    private fun localDialogHeadersForChinaUnicomUpdate(call: Call): SipHeadersMap =
+        localDialogHeadersForRequest(call, SipMethod.UPDATE) -
+            "content-length" -
+            "require" -
+            "contact" +
+            ("contact" to listOf(compactChinaUnicomContact())) +
+            ("content-type" to listOf("application/sdp"))
 
     fun handleAck(request: SipRequest): Int {
         val callId = request.callIdOrEmpty()
@@ -2413,6 +2569,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
     private data class UpdateSdpAnswerState(
         val updatedCall: Call,
         val answerSdp: ByteArray,
+        val offerAttributes: List<String>,
     )
 
     private fun prepareUpdateSdpAnswer(
@@ -2475,6 +2632,44 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         return UpdateSdpAnswerState(
             updatedCall = updatedCall,
             answerSdp = answerSdp,
+            offerAttributes = attributes,
+        )
+    }
+
+    private fun sendChinaUnicomFinalPreconditionUpdateAfterRemoteUpdate(
+        call: Call,
+        offerAttributes: List<String>,
+    ) {
+        if (!call.outgoing || !isChinaUnicomStockOutgoingCarrier()) return
+        if (!call.chinaUnicomFinalPreconditionUpdateSent.compareAndSet(false, true)) {
+            Rlog.d(
+                TAG,
+                "Skipping duplicate China Unicom final precondition UPDATE callId=${call.callIdOrEmpty()}",
+            )
+            return
+        }
+
+        val callId = call.callIdOrEmpty()
+        val respSdp = offerAttributes.map { "a=$it" }
+        val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
+            respSdp = respSdp,
+            call = call,
+            remoteHasLocalQos = true,
+            compactChinaUnicom = true,
+            nextLocalSdpVersion = { call.localSdpVersion.incrementAndGet() },
+        )
+        val updateHeaders = localDialogHeadersForChinaUnicomUpdate(call)
+        val msg = SipOutgoingDialogSdp.buildPreconditionUpdateRequest(
+            remoteContact = call.remoteContact,
+            fallbackTarget = call.remoteContact,
+            updateHeaders = updateHeaders,
+            newSdp = newSdp,
+        )
+        Rlog.d(TAG, "Sending China Unicom final precondition UPDATE after remote UPDATE callId=$callId $msg")
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            "SipHandler china-unicom-final-update",
+            msg.toByteArray(),
         )
     }
 
@@ -2530,6 +2725,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             updatedCallId = updateSdpAnswerState.updatedCall.callIdOrEmpty(),
             answerSdp = updateSdpAnswerState.answerSdp,
             logTag = TAG,
+        )
+
+        sendChinaUnicomFinalPreconditionUpdateAfterRemoteUpdate(
+            call = updateSdpAnswerState.updatedCall,
+            offerAttributes = updateSdpAnswerState.offerAttributes,
         )
 
         return 0
@@ -2685,7 +2885,11 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val remoteContact: String,
         val incomingResponseWriter: OutputStream? = null,
         val localCseq: AtomicInteger = AtomicInteger(2),
-        val localSdpVersion: AtomicInteger = AtomicInteger(2), val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false), val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false), )
+        val localSdpVersion: AtomicInteger = AtomicInteger(2),
+        val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false),
+        val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false),
+        val chinaUnicomFinalPreconditionUpdateSent: AtomicBoolean = AtomicBoolean(false),
+    )
 
     // illegal SDP conservative retry: retry once only when the SBC explicitly rejects the SDP body.
 
@@ -3716,6 +3920,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
             registerTargetRealm.equals("ims.singtel.com", ignoreCase = true)
 
+    private fun isChinaUnicomStockOutgoingCarrier(): Boolean =
+        mcc == "460" && mnc == "001"
+
     private fun singtelStockLocalNumberForPhoneContext(number: String): String {
         val digits = number.trim().trimStart('+')
         return if (digits.startsWith("65") && digits.length == 10) {
@@ -3778,6 +3985,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
             amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
             singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
+            compactProtectedOutgoingInvite =
+                isSingTelStockOutgoingCarrier() || isChinaUnicomStockOutgoingCarrier(),
+            chinaUnicomStockOutgoingCarrier = isChinaUnicomStockOutgoingCarrier(),
         )
     }
 
@@ -3814,6 +4024,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             minSeSeconds = outgoingInviteSessionTimer.minSeSeconds,
             generatedCallIdHeaders = generateCallId(),
             singtelStockOutgoingCarrier = isSingTelStockOutgoingCarrier(),
+            chinaUnicomStockOutgoingCarrier = isChinaUnicomStockOutgoingCarrier(),
             singtelPublicSipUri = { number -> singtelPublicSipUri(number) },
         )
     }
@@ -3892,6 +4103,38 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         )
     }
 
+    private fun sendOutgoingFinalInviteErrorAckIfNeeded(
+        response: SipResponse,
+        myHeaders: Map<String, List<String>>,
+        fallbackTarget: String,
+    ) {
+        val responseCseq = response.headers["cseq"]?.getOrNull(0).orEmpty()
+        if (!responseCseq.contains("INVITE", ignoreCase = true) ||
+            response.statusCode < 300 ||
+            response.statusCode == 401 ||
+            response.statusCode == 407) {
+            return
+        }
+
+        val inviteCseq = responseCseq.split(" ").firstOrNull()?.toIntOrNull() ?: return
+        val ackHeaders = myHeaders - "content-type" - "content-length" + """
+            CSeq: $inviteCseq ACK
+            To: ${response.headers["to"]?.getOrNull(0).orEmpty()}
+            From: ${response.headers["from"]?.getOrNull(0).orEmpty()}
+            """.toSipHeadersMap()
+        val ack = SipRequest(
+            SipMethod.ACK,
+            fallbackTarget,
+            ackHeaders,
+        )
+        Rlog.d(TAG, "Sending final non-2xx INVITE ACK $ack")
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            "SipHandler final-invite-error-ack",
+            ack.toByteArray(),
+        )
+    }
+
 
     private fun updateOutgoingDialogAfterFinalInviteAck(
         response: SipResponse,
@@ -3916,6 +4159,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 callHeaders = confirmedHeaders,
                 remoteContact = remoteTargetFrom200Ok ?: confirmedCall.remoteContact,
                 localCseq = AtomicInteger(keptCseq),
+                chinaUnicomFinalPreconditionUpdateSent = confirmedCall.chinaUnicomFinalPreconditionUpdateSent,
             )
         }
         currentCall?.let { confirmedCall ->
@@ -4020,6 +4264,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         response: SipResponse,
         cseq: String,
         outgoingDialogNextCseq: AtomicInteger,
+        myHeaders: Map<String, List<String>>,
+        fallbackTarget: String,
     ): Boolean? {
         if (cseq.contains("INVITE") && (response.statusCode == 200 || response.statusCode == 202)) {
             return null
@@ -4066,6 +4312,24 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             ) {
                 return false
             }
+
+            if (response.statusCode == 491 &&
+                failedCseq.contains("UPDATE", ignoreCase = true) &&
+                (activeCallId == failedCallId || pendingCallId == failedCallId)) {
+                Rlog.w(
+                    TAG,
+                    "Ignoring recoverable outgoing UPDATE glare: " +
+                        "status=${response.statusCode} ${response.statusString} " +
+                        "cseq=$failedCseq callId=$failedCallId",
+                )
+                return false
+            }
+
+            sendOutgoingFinalInviteErrorAckIfNeeded(
+                response = response,
+                myHeaders = myHeaders,
+                fallbackTarget = fallbackTarget,
+            )
 
             Rlog.w(
                 TAG,
@@ -4189,8 +4453,9 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         rtpSocket: DatagramSocket,
         answer: OutgoingDialogSdpAnswer,
         nextLocalCseqForDialog: Int,
-    ): Call =
-        Call(
+    ): Call {
+        val previousOutgoingDialogCall = currentCall
+        return Call(
             outgoing = true,
             audioCodec = answer.dialogAudioCodec,
             amrTrack = answer.dialogAmrTrack,
@@ -4211,7 +4476,10 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             hasEarlyMedia = response.headers["p-early-media"]?.isNotEmpty() == true,
             remoteContact = extractDestinationFromContact(response.headers["contact"]!![0]),
             localCseq = AtomicInteger(nextLocalCseqForDialog),
+            chinaUnicomFinalPreconditionUpdateSent =
+                previousOutgoingDialogCall?.chinaUnicomFinalPreconditionUpdateSent ?: AtomicBoolean(false),
         )
+    }
 
 
     private fun logOutgoingDialogSdpInstall(
@@ -4409,12 +4677,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 respSdp = respSdp,
                 call = currentCall!!,
                 remoteHasLocalQos = remoteHasLocalQos,
+                compactChinaUnicom = isChinaUnicomStockOutgoingCarrier(),
                 nextLocalSdpVersion = { currentCall?.localSdpVersion?.incrementAndGet() ?: 3 },
             )
 
-            val updateHeaders = localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE) -
-                "content-length" +
-                ("content-type" to listOf("application/sdp"))
+            val updateHeaders =
+                if (isChinaUnicomStockOutgoingCarrier()) {
+                    localDialogHeadersForChinaUnicomUpdate(currentCall!!)
+                } else {
+                    localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE) -
+                        "content-length" +
+                        ("content-type" to listOf("application/sdp"))
+                }
 
             val msg2 = SipOutgoingDialogSdp.buildPreconditionUpdateRequest(
                 remoteContact = currentCall!!.remoteContact,
@@ -4475,6 +4749,18 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         ) ?: return false
         val isPrecondition = outgoingDialogSdpAnswer.isPrecondition
         val respSdp = outgoingDialogSdpAnswer.respSdp
+        val chinaUnicomHasQosPreconditionSdp =
+            isChinaUnicomStockOutgoingCarrier() &&
+                respSdp.any { it.startsWith("a=curr:qos local", ignoreCase = true) } &&
+                respSdp.any { it.startsWith("a=curr:qos remote", ignoreCase = true) }
+        val shouldHandleAsPrecondition = isPrecondition || chinaUnicomHasQosPreconditionSdp
+        if (!isPrecondition && chinaUnicomHasQosPreconditionSdp && response.statusCode == 183) {
+            Rlog.d(
+                TAG,
+                "Treating China Unicom 183 QoS SDP as precondition without Require header " +
+                    "callId=${response.callIdOrEmpty()}",
+            )
+        }
 
         val outgoingDialogSdpInstall = installOutgoingDialogFromSdpAnswer(
             response = response,
@@ -4496,14 +4782,14 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
 
         handleOutgoingPrecondition183IfNeeded(
             response = response,
-            isPrecondition = isPrecondition,
+            isPrecondition = shouldHandleAsPrecondition,
             respSdp = respSdp,
             fallbackTarget = fallbackTarget,
         )?.let { return it }
 
         startOutgoingMediaForNonPrecondition183IfNeeded(
             response = response,
-            isPrecondition = isPrecondition,
+            isPrecondition = shouldHandleAsPrecondition,
         )
 
         return false
@@ -4554,6 +4840,8 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             response = resp,
             cseq = cseq,
             outgoingDialogNextCseq = outgoingDialogNextCseq,
+            myHeaders = myHeaders,
+            fallbackTarget = to,
         )?.let { return it }
 
         handleOutgoingReliableProvisionalIfNeeded(
@@ -4650,7 +4938,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         registerOutgoingInviteResponseCallback(
             outgoingInviteCallId = sendState.callId,
             outgoingDialogNextCseq = sendState.outgoingDialogNextCseq,
-            myHeaders = requestContext.baseHeaders,
+            myHeaders = requestContext.request.headers,
             rtpSocket = rtpSocket,
             amrNbTrack = sdpOffer.amrNbTrack,
             dtmfNbTrack = sdpOffer.dtmfNbTrack,

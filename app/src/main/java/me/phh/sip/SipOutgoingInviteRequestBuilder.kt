@@ -114,6 +114,7 @@ internal object SipOutgoingInviteRequestBuilder {
         minSeSeconds: Int,
         generatedCallIdHeaders: Map<String, List<String>>,
         singtelStockOutgoingCarrier: Boolean,
+        chinaUnicomStockOutgoingCarrier: Boolean,
         singtelPublicSipUri: (String) -> String,
     ): OutgoingInviteRequestContext {
         val baseRequestContext = buildBaseRequestContext(
@@ -140,10 +141,14 @@ internal object SipOutgoingInviteRequestBuilder {
             sipInstance = baseRequestContext.sipInstance,
             localEndpoint = baseRequestContext.localEndpoint,
             transport = baseRequestContext.transport,
+            mySip = mySip,
             myTel = myTel,
             imsi = imsi,
+            mcc = mcc,
+            mnc = mnc,
             commonHeaders = commonHeaders,
             singtelStockOutgoingCarrier = singtelStockOutgoingCarrier,
+            chinaUnicomStockOutgoingCarrier = chinaUnicomStockOutgoingCarrier,
             singtelPublicSipUri = singtelPublicSipUri,
         )
         return buildRequestContext(
@@ -228,10 +233,14 @@ internal object SipOutgoingInviteRequestBuilder {
         sipInstance: String,
         localEndpoint: String,
         transport: String,
+        mySip: String,
         myTel: String,
         imsi: String,
+        mcc: String,
+        mnc: String,
         commonHeaders: Map<String, List<String>>,
         singtelStockOutgoingCarrier: Boolean,
+        chinaUnicomStockOutgoingCarrier: Boolean,
         singtelPublicSipUri: (String) -> String,
     ): OutgoingInviteCarrierRequestShape {
         val singtelStockOutgoingTargetUri = if (singtelStockOutgoingCarrier) {
@@ -239,6 +248,12 @@ internal object SipOutgoingInviteRequestBuilder {
         } else {
             telUri
         }
+        val chinaUnicomOutgoingTargetUri =
+            if (chinaUnicomStockOutgoingCarrier && normalizedPhoneNumber.all { it.isDigit() }) {
+                "tel:$normalizedPhoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
+            } else {
+                singtelStockOutgoingTargetUri
+            }
 
         val singtelStockOutgoingHeaders = if (singtelStockOutgoingCarrier) {
             val singtelStockIdentity = singtelPublicSipUri(myTel)
@@ -295,9 +310,43 @@ internal object SipOutgoingInviteRequestBuilder {
             baseHeaders
         }
 
+        val chinaUnicomOutgoingHeaders = if (chinaUnicomStockOutgoingCarrier) {
+            val stockIdentity = mySip
+            val stockFromTag = baseHeaders["from"]?.firstOrNull()
+                ?.substringAfter(";tag=", missingDelimiterValue = "")
+                ?.substringBefore(";")
+                ?.takeIf { it.isNotBlank() }
+                ?: "phh${System.currentTimeMillis().toString(16)}"
+            val stockContact = "<sip:$imsi@$localEndpoint;transport=$transport>"
+            val stockBaseHeaders = baseHeaders.filterKeys { key ->
+                key.equals("via", ignoreCase = true) ||
+                    key.equals("max-forwards", ignoreCase = true) ||
+                    key.equals("user-agent", ignoreCase = true) ||
+                    key.equals("route", ignoreCase = true) ||
+                    key.equals("call-id", ignoreCase = true) ||
+                    key.equals("security-verify", ignoreCase = true) ||
+                    key.equals("proxy-require", ignoreCase = true)
+            }
+
+            stockBaseHeaders + """
+                From: <$stockIdentity>;tag=$stockFromTag
+                To: <$chinaUnicomOutgoingTargetUri>
+                Contact: $stockContact
+                P-Preferred-Identity: <$stockIdentity>
+                Require: sec-agree
+                Proxy-Require: sec-agree
+                Content-Type: application/sdp
+                Allow: INVITE, ACK, CANCEL, BYE, UPDATE, PRACK, OPTIONS
+                Supported: 100rel, sec-agree, precondition
+                CSeq: 1 INVITE
+            """.toSipHeadersMap()
+        } else {
+            singtelStockOutgoingHeaders
+        }
+
         return OutgoingInviteCarrierRequestShape(
-            targetUri = singtelStockOutgoingTargetUri,
-            headers = singtelStockOutgoingHeaders,
+            targetUri = chinaUnicomOutgoingTargetUri,
+            headers = chinaUnicomOutgoingHeaders,
         )
     }
 

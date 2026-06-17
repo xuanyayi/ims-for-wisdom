@@ -53,6 +53,15 @@ class PhhImsBroadcastReceiver : BroadcastReceiver() {
                         Rlog.e(TAG, "Reconnect after failed REGISTER also failed", e2)
                         sipHandler.imsFailureCallback?.invoke()
                     }
+                } catch (t: Throwable) {
+                    Rlog.w(TAG, "Periodic REGISTER skipped because IMS is not connected, reconnecting", t)
+
+                    try {
+                        sipHandler.connect()
+                    } catch (e2: Throwable) {
+                        Rlog.e(TAG, "Reconnect after skipped REGISTER also failed", e2)
+                        sipHandler.imsFailureCallback?.invoke()
+                    }
                 }
             }
         }
