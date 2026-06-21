@@ -1,7 +1,6 @@
 package me.phh.sip
 
 import android.telephony.Rlog
-import android.telephony.PhoneNumberUtils
 
 internal data class OutgoingInviteRequestContext(
     val request: SipRequest,
@@ -27,11 +26,83 @@ private data class OutgoingInviteCarrierRequestShape(
 
 internal object SipOutgoingInviteRequestBuilder {
 
-    // Vodafone TR carrier policy helpers.
-    private fun isVodafoneTurkeyCarrier(mcc: String, mnc: String): Boolean {
-        val normalizedMnc = mnc.trimStart('0').ifBlank { "0" }
-        return mcc == "286" && normalizedMnc == "2"
+    // Scoped short service TEL URI policy.
+    //
+    // Local TEL numbers need a phone-context. Some IMS cores reject plain local
+    // short-code targets such as tel:121 with "Local phone number without phone
+    // context". Keep E.164 targets unchanged, and keep the known Vodafone TR
+    // service-number exception plain because that carrier rejected the generic
+    // MCC/MNC context for 542.
+    private fun normalizedMncForPhoneContext(mnc: String): String =
+        mnc.trim().trimStart('0').ifBlank { "0" }.padStart(3, '0')
+
+    private fun phoneContextForLocalTelUri(realm: String, mcc: String, mnc: String): String {
+        val candidate = realm.trim()
+            .removePrefix("sip:")
+            .substringBefore(";")
+            .substringAfter("@")
+            .trim()
+
+        if (candidate.isNotBlank() &&
+            candidate.none { it.isWhitespace() || it == '<' || it == '>' || it == '"' } &&
+            !candidate.contains(":")) {
+            return candidate
+        }
+
+        return "ims.mnc${normalizedMncForPhoneContext(mnc)}.mcc${mcc.trim().padStart(3, '0')}.3gppnetwork.org"
     }
+
+    // Kept separate because Vodafone TR outgoing PANI policy uses this too.
+    private fun isVodafoneTurkeyCarrier(mcc: String, mnc: String): Boolean =
+        mcc.trim() == "286" && normalizedMncForPhoneContext(mnc) == "002"
+
+    private fun shouldKeepShortServicePlainTel(
+        normalizedPhoneNumber: String,
+        mcc: String,
+        mnc: String,
+    ): Boolean {
+        // Confirmed compatibility exception: Vodafone TR service code 542 worked
+        // as plain tel:<digits> and broke with the generic MCC/MNC phone-context.
+        return isVodafoneTurkeyCarrier(mcc, mnc) &&
+            normalizedPhoneNumber.length in 3..6 &&
+            normalizedPhoneNumber.all { it.isDigit() }
+    }
+
+    private fun shortServiceTelUri(
+        normalizedPhoneNumber: String,
+        mcc: String,
+        mnc: String,
+        realm: String,
+    ): String? {
+        if (normalizedPhoneNumber.length !in 3..6 ||
+            !normalizedPhoneNumber.all { it.isDigit() }) {
+            return null
+        }
+
+        val fallbackEmergencyShortCodes = setOf(
+            "000", // AU and others
+            "110", // DE police and others
+            "112", // EU/common emergency
+            "118",
+            "119",
+            "911", // NANP/common emergency
+            "999", // UK/common emergency
+        )
+
+        // If an emergency-like code reaches this normal MMTel path anyway, do
+        // not add a phone-context here. The real emergency path should handle it.
+        if (normalizedPhoneNumber in fallbackEmergencyShortCodes) {
+            return "tel:$normalizedPhoneNumber"
+        }
+
+        if (shouldKeepShortServicePlainTel(normalizedPhoneNumber, mcc, mnc)) {
+            return "tel:$normalizedPhoneNumber"
+        }
+
+        return "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, mcc, mnc)}"
+    }
+
+    // Vodafone TR carrier policy helpers.
 
     // Vodafone TR outgoing PANI policy.
     private fun vodafoneTurkeyOutgoingPaniHeaders(
@@ -55,46 +126,6 @@ internal object SipOutgoingInviteRequestBuilder {
     }
 
 
-    // Generic short service TEL URI policy.
-    //
-    // Short carrier/public service numbers should stay local:
-    //   542    -> tel:542
-    //   116117 -> tel:116117
-    //
-    // Adding the generic ims.mnc/mcc phone-context can make carriers interpret
-    // the number in the wrong home-network context, which broke Vodafone TR 542.
-    //
-    // Emergency numbers are deliberately excluded here. They must be handled by
-    // Android/telephony emergency routing, not by the normal MMTel service-call
-    // URI policy.
-    @Suppress("DEPRECATION")
-    private fun shortServiceTelUri(normalizedPhoneNumber: String): String? {
-        if (normalizedPhoneNumber.length !in 3..6 ||
-            !normalizedPhoneNumber.all { it.isDigit() }) {
-            return null
-        }
-
-        // Prefer Android's emergency-number database/classifier. Keep a tiny
-        // fallback denylist for common emergency codes in case the framework
-        // helper does not classify a code on a given build/locale.
-        val fallbackEmergencyShortCodes = setOf(
-            "000", // AU and others
-            "08",
-            "110", // DE police and others
-            "112", // EU/common emergency
-            "118",
-            "119",
-            "911", // NANP/common emergency
-            "999", // UK/common emergency
-        )
-
-        if (PhoneNumberUtils.isEmergencyNumber(normalizedPhoneNumber) ||
-            normalizedPhoneNumber in fallbackEmergencyShortCodes) {
-            return null
-        }
-
-        return "tel:$normalizedPhoneNumber"
-    }
     fun build(
         logTag: String,
         phoneNumber: String,
@@ -102,6 +133,7 @@ internal object SipOutgoingInviteRequestBuilder {
         normalizedPhoneNumber: String,
         mcc: String,
         mnc: String,
+        realm: String,
         registrationTech: Int,
         mySip: String,
         myTel: String,
@@ -123,6 +155,7 @@ internal object SipOutgoingInviteRequestBuilder {
             normalizedPhoneNumber = normalizedPhoneNumber,
             mcc = mcc,
             mnc = mnc,
+            realm = realm,
             registrationTech = registrationTech,
             mySip = mySip,
             myTel = myTel,
@@ -164,6 +197,7 @@ internal object SipOutgoingInviteRequestBuilder {
         normalizedPhoneNumber: String,
         mcc: String,
         mnc: String,
+        realm: String,
         registrationTech: Int,
         mySip: String,
         myTel: String,
@@ -175,15 +209,19 @@ internal object SipOutgoingInviteRequestBuilder {
         minSeSeconds: Int,
         generatedCallIdHeaders: Map<String, List<String>>,
     ): OutgoingInviteBaseRequestContext {
-        val to = shortServiceTelUri(normalizedPhoneNumber)
-            ?: if (normalizedPhoneNumber.startsWith("+")) {
+        val to = shortServiceTelUri(
+            normalizedPhoneNumber = normalizedPhoneNumber,
+            mcc = mcc,
+            mnc = mnc,
+            realm = realm,
+        ) ?: if (normalizedPhoneNumber.startsWith("+")) {
             // Global TEL URIs must stand on their own. Adding phone-context to +E.164
             // numbers makes some IMS cores drop the INVITE without any SIP response.
             "tel:$normalizedPhoneNumber"
         } else {
             // Short service numbers were handled above. Other local numbers
             // keep the generic IMS phone-context.
-            "tel:$normalizedPhoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
+            "tel:$normalizedPhoneNumber;phone-context=${phoneContextForLocalTelUri(realm, mcc, mnc)}"
         }
         Rlog.d(logTag, "Outgoing dial target raw=$phoneNumber normalized=$normalizedPhoneNumber uri=$to")
         val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
