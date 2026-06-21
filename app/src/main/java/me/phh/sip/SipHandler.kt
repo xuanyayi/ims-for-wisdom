@@ -36,6 +36,8 @@ class SipHandler(
         private const val INCOMING_ACCEPT_IMS_ACCESS_CHANGE_GUARD_MS = 1_200L
         private const val REGISTER_REFRESH_RESPONSE_TIMEOUT_MS = 15_000L
         private const val REGISTER_MAX_AGE_FOR_OUTGOING_CALL_MS = 115L * 60L * 1000L
+        private const val DOWNLINK_AUDIO_RETRY_INITIAL_MS = 800L
+        private const val DOWNLINK_AUDIO_RETRY_MAX_MS = 5_000L
     }
 
     val myHandler = Handler(HandlerThread("PhhMmTelFeature").apply { start() }.looper)
@@ -201,6 +203,9 @@ class SipHandler(
     private val incomingFinalResponseSent = AtomicBoolean(false)
     private val incomingAcceptedAwaitingAck = AtomicBoolean(false)
     private val incomingHangupAfterAck = AtomicBoolean(false)
+    private val downlinkAudioRetryPending = AtomicBoolean(false)
+    private val downlinkAudioUnavailable = AtomicBoolean(false)
+    private val downlinkAudioRetryAttempt = AtomicInteger(0)
     private val terminatedIncomingCallIds = RecentCallIdCache(
         tag = TAG,
         label = "terminated incoming",
@@ -464,6 +469,7 @@ private val smsHandler = SipSmsHandler(
         callStopped.set(true)
         callStarted.set(false)
         threadsStarted.set(false)
+        resetDownlinkAudioRuntimeState("stop runtime: $reason")
 
         SipAudioModeRestorer.restoreAfterImsCall(
             logTag = TAG,
@@ -3308,6 +3314,16 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
                 if (!activeCall.outgoing || activeCallId != callId) return@thread
                 if (activeCall.outgoingConnectedNotified.get() || activeCall.outgoingRtpReceived.get()) return@thread
                 if (!callStarted.get()) return@thread
+                if (downlinkAudioUnavailable.get() || downlinkAudioRetryPending.get()) {
+                    Rlog.w(
+                        TAG,
+                        "Deferring outgoing post-answer RTP timeout while downlink audio is unavailable: " +
+                            "callId=$callId retryPending=${downlinkAudioRetryPending.get()} " +
+                            "attempts=${downlinkAudioRetryAttempt.get()}",
+                    )
+                    scheduleOutgoingPostAnswerRtpTimeout(callId, timeoutMs)
+                    return@thread
+                }
 
                 Rlog.w(TAG, SipOutgoingCallConnectionLogs.postAnswerRtpTimeoutLog(timeoutMs, callId))
                 callId?.let { outgoingConnectedCallIds.remove(it) }
@@ -4990,6 +5006,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
             callStopped.set(false)
             callStarted.set(false)
             threadsStarted.set(false)
+            resetDownlinkAudioRuntimeState("new outgoing call")
             callGeneration.incrementAndGet()
             clearPendingOutgoingInvite(closeRtpSocket = true, reason = "new outgoing call")
 
@@ -5104,10 +5121,72 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val previousAudioMode: Int,
     )
 
+    private fun resetDownlinkAudioRuntimeState(reason: String) {
+        val hadRetryState =
+            downlinkAudioRetryPending.get() ||
+                downlinkAudioUnavailable.get() ||
+                downlinkAudioRetryAttempt.get() != 0
+        downlinkAudioRetryPending.set(false)
+        downlinkAudioUnavailable.set(false)
+        downlinkAudioRetryAttempt.set(0)
+        if (hadRetryState) {
+            Rlog.d(TAG, "Reset downlink audio retry state: $reason")
+        }
+    }
+
+    private fun scheduleDownlinkAudioRetry(
+        audioCodec: NegotiatedAudioCodec,
+        generation: Int,
+        reason: String,
+    ) {
+        if (!downlinkAudioRetryPending.compareAndSet(false, true)) {
+            Rlog.d(
+                TAG,
+                "Downlink audio retry already pending: reason=$reason " +
+                    "attempts=${downlinkAudioRetryAttempt.get()} gen=$generation",
+            )
+            return
+        }
+
+        val attempt = downlinkAudioRetryAttempt.incrementAndGet()
+        val retryDelayMs = (DOWNLINK_AUDIO_RETRY_INITIAL_MS * attempt)
+            .coerceAtMost(DOWNLINK_AUDIO_RETRY_MAX_MS)
+        Rlog.w(
+            TAG,
+            "Scheduling downlink audio retry #$attempt in ${retryDelayMs}ms: " +
+                "reason=$reason codec=${audioCodec.name}/${audioCodec.sampleRate} gen=$generation",
+        )
+
+        myHandler.postDelayed({
+            downlinkAudioRetryPending.set(false)
+            val active = currentCall
+            if (active == null || callStopped.get() || callGeneration.get() != generation) {
+                Rlog.d(
+                    TAG,
+                    "Skipping stale downlink audio retry #$attempt: " +
+                        "hasCall=${active != null} callStopped=${callStopped.get()} " +
+                        "gen=${callGeneration.get()} expected=$generation",
+                )
+                return@postDelayed
+            }
+            if (!downlinkAudioUnavailable.get()) {
+                Rlog.d(TAG, "Skipping downlink audio retry #$attempt; audio runtime already recovered")
+                return@postDelayed
+            }
+
+            Rlog.w(
+                TAG,
+                "Retrying downlink audio runtime #$attempt: " +
+                    "codec=${active.audioCodec.name}/${active.audioCodec.sampleRate} gen=$generation",
+            )
+            callDecodeThread()
+        }, retryDelayMs)
+    }
+
     private fun createDownlinkAudioRuntime(
         audioCodec: NegotiatedAudioCodec,
         generation: Int,
-    ): DownlinkAudioRuntime {
+    ): DownlinkAudioRuntime? {
         try {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             Rlog.d(TAG, "Downlink RTP/decode thread priority set to urgent audio")
@@ -5118,41 +5197,89 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         Rlog.d(TAG, "Decode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} gen=$generation")
         val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)
         val prevDecodeAudioMode = audioManager.mode
-        if (prevDecodeAudioMode != AudioManager.MODE_IN_COMMUNICATION) {
-            Rlog.d(TAG, "Decode thread forcing MODE_IN_COMMUNICATION before AudioTrack: was=$prevDecodeAudioMode")
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        var audioTrack: android.media.AudioTrack? = null
+        var decoder: android.media.MediaCodec? = null
+        var downlinkPlayoutBuffers: SipDownlinkPcmPlayoutBuffers? = null
+        var downlinkPlayoutThread: Thread? = null
+
+        try {
+            if (prevDecodeAudioMode != AudioManager.MODE_IN_COMMUNICATION) {
+                Rlog.d(TAG, "Decode thread forcing MODE_IN_COMMUNICATION before AudioTrack: was=$prevDecodeAudioMode")
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            }
+            audioTrack = SipAudioTrackFactory.createVoiceCallTrack(
+                audioCodec = audioCodec,
+            )
+            if (audioTrack.state != android.media.AudioTrack.STATE_INITIALIZED) {
+                throw IllegalStateException("AudioTrack not initialized: state=${audioTrack.state}")
+            }
+            audioTrack.play()
+            // PhhIms downlink PCM playout smoother: decouple RTP receive jitter
+            // from AudioTrack writes. IVR/transfer gateways can burst packets or
+            // send sparse SID/CN frames after DTMF; writing only when RTP arrives
+            // lets AudioTrack underrun and sounds like heavy stutter. Keep a tiny
+            // 20ms playout loop and feed silence when the decoder has no PCM ready.
+            downlinkPlayoutBuffers = SipDownlinkPcmPlayoutBuffers.create(audioCodec)
+            downlinkPlayoutThread = SipDownlinkPcmPlayout.start(
+                logTag = TAG,
+                audioTrack = audioTrack,
+                audioCodec = audioCodec,
+                buffers = downlinkPlayoutBuffers,
+                callStopped = callStopped,
+                callGeneration = callGeneration,
+                generation = generation,
+            )
+
+            decoder = SipAudioCodecFactory.createStartedDecoder(
+                audioCodec = audioCodec,
+            )
+
+            resetDownlinkAudioRuntimeState("downlink audio runtime started")
+            return DownlinkAudioRuntime(
+                audioTrack = audioTrack,
+                decoder = decoder,
+                playoutBuffers = downlinkPlayoutBuffers,
+                playoutThread = downlinkPlayoutThread,
+                previousAudioMode = prevDecodeAudioMode,
+            )
+        } catch (t: Throwable) {
+            downlinkAudioUnavailable.set(true)
+            Rlog.w(
+                TAG,
+                "Downlink audio runtime init failed; keeping IMS call alive and retrying: " +
+                    "codec=${audioCodec.name}/${audioCodec.sampleRate} gen=$generation",
+                t,
+            )
+            downlinkPlayoutBuffers?.running?.set(false)
+            try {
+                downlinkPlayoutThread?.interrupt()
+            } catch (ignored: Throwable) {
+                Rlog.d(TAG, "Downlink playout interrupt failed after audio init failure", ignored)
+            }
+            try {
+                audioTrack?.release()
+            } catch (ignored: Throwable) {
+                Rlog.d(TAG, "AudioTrack release failed after audio init failure", ignored)
+            }
+            try {
+                decoder?.stop()
+            } catch (ignored: Throwable) {
+                Rlog.d(TAG, "Decoder stop failed after audio init failure", ignored)
+            }
+            try {
+                decoder?.release()
+            } catch (ignored: Throwable) {
+                Rlog.d(TAG, "Decoder release failed after audio init failure", ignored)
+            }
+            if (callGeneration.get() == generation && !callStopped.get()) {
+                scheduleDownlinkAudioRetry(
+                    audioCodec = audioCodec,
+                    generation = generation,
+                    reason = "${t.javaClass.simpleName}: ${t.message.orEmpty()}",
+                )
+            }
+            return null
         }
-        val audioTrack = SipAudioTrackFactory.createVoiceCallTrack(
-            audioCodec = audioCodec,
-        )
-        audioTrack.play()
-        // PhhIms downlink PCM playout smoother: decouple RTP receive jitter
-        // from AudioTrack writes. IVR/transfer gateways can burst packets or
-        // send sparse SID/CN frames after DTMF; writing only when RTP arrives
-        // lets AudioTrack underrun and sounds like heavy stutter. Keep a tiny
-        // 20ms playout loop and feed silence when the decoder has no PCM ready.
-        val downlinkPlayoutBuffers = SipDownlinkPcmPlayoutBuffers.create(audioCodec)
-        val downlinkPlayoutThread = SipDownlinkPcmPlayout.start(
-            logTag = TAG,
-            audioTrack = audioTrack,
-            audioCodec = audioCodec,
-            buffers = downlinkPlayoutBuffers,
-            callStopped = callStopped,
-            callGeneration = callGeneration,
-            generation = generation,
-        )
-
-        val decoder = SipAudioCodecFactory.createStartedDecoder(
-            audioCodec = audioCodec,
-        )
-
-        return DownlinkAudioRuntime(
-            audioTrack = audioTrack,
-            decoder = decoder,
-            playoutBuffers = downlinkPlayoutBuffers,
-            playoutThread = downlinkPlayoutThread,
-            previousAudioMode = prevDecodeAudioMode,
-        )
     }
 
 
@@ -5192,36 +5319,53 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         val audioCodec = currentCall?.audioCodec ?: SipAudioCodecs.AMR_NB
         val gen = callGeneration.get()
         // Receiving thread
-        thread {
-            val downlinkRuntime = createDownlinkAudioRuntime(
-                audioCodec = audioCodec,
-                generation = gen,
-            )
-            val audioTrack = downlinkRuntime.audioTrack
-            val decoder = downlinkRuntime.decoder
-            val downlinkPlayoutBuffers = downlinkRuntime.playoutBuffers
-            val downlinkPlayoutThread = downlinkRuntime.playoutThread
-            val prevDecodeAudioMode = downlinkRuntime.previousAudioMode
+        thread(name = "PhhDownlinkRtpDecode") {
+            var downlinkRuntime: DownlinkAudioRuntime? = null
+            var receivedCount = 0
+            try {
+                downlinkRuntime = createDownlinkAudioRuntime(
+                    audioCodec = audioCodec,
+                    generation = gen,
+                ) ?: return@thread
 
-            val receivedCount = runDownlinkRtpReceiveLoop(
-                audioCodec = audioCodec,
-                decoder = decoder,
-                downlinkPlayoutBuffers = downlinkPlayoutBuffers,
-                generation = gen,
-            )
-            SipDownlinkAudioCleanup.cleanup(
-                logTag = TAG,
-                context = ctxt,
-                audioTrack = audioTrack,
-                decoder = decoder,
-                playoutBuffers = downlinkPlayoutBuffers,
-                playoutThread = downlinkPlayoutThread,
-                callStopped = callStopped,
-                callGeneration = callGeneration,
-                generation = gen,
-                receivedCount = receivedCount,
-                previousAudioMode = prevDecodeAudioMode,
-            )
+                receivedCount = runDownlinkRtpReceiveLoop(
+                    audioCodec = audioCodec,
+                    decoder = downlinkRuntime.decoder,
+                    downlinkPlayoutBuffers = downlinkRuntime.playoutBuffers,
+                    generation = gen,
+                )
+            } catch (t: Throwable) {
+                downlinkAudioUnavailable.set(true)
+                Rlog.e(
+                    TAG,
+                    "Downlink RTP/decode thread failed; keeping IMS call alive and retrying: gen=$gen",
+                    t,
+                )
+                if (callGeneration.get() == gen && !callStopped.get()) {
+                    scheduleDownlinkAudioRetry(
+                        audioCodec = audioCodec,
+                        generation = gen,
+                        reason = "${t.javaClass.simpleName}: ${t.message.orEmpty()}",
+                    )
+                }
+            } finally {
+                val runtime = downlinkRuntime
+                if (runtime != null) {
+                    SipDownlinkAudioCleanup.cleanup(
+                        logTag = TAG,
+                        context = ctxt,
+                        audioTrack = runtime.audioTrack,
+                        decoder = runtime.decoder,
+                        playoutBuffers = runtime.playoutBuffers,
+                        playoutThread = runtime.playoutThread,
+                        callStopped = callStopped,
+                        callGeneration = callGeneration,
+                        generation = gen,
+                        receivedCount = receivedCount,
+                        previousAudioMode = runtime.previousAudioMode,
+                    )
+                }
+            }
         }
     }
 
@@ -5538,6 +5682,7 @@ private fun scheduleReconnectRetry(reason: String, delayMs: Long) {
         callStopped.set(false)
         callStarted.set(false)
         threadsStarted.set(false)
+        resetDownlinkAudioRuntimeState("new incoming call")
         callGeneration.incrementAndGet()
         incomingFinalResponseSent.set(false)
         incomingAcceptedAwaitingAck.set(false)
