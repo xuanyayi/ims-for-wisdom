@@ -126,14 +126,31 @@ internal object SipIncomingInviteDialogSetup {
         }
         try {
             bindSocket(rtpSocket)
-            rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            // Do not connect incoming RTP sockets. A connected DatagramSocket filters
+            // received UDP packets to the connected remote address and port. Some IMS
+            // media gateways send downlink RTP from a source port different from the
+            // offered SDP m=audio port, while still accepting uplink RTP sent to the
+            // offered port.
+            //
+            // Keep uplink sends explicit via RtpPacketSender and leave receive()
+            // unrestricted to the actual media source on the IMS network.
+            Rlog.d(
+                logTag,
+                "Incoming RTP socket left unconnected; txTarget=${rtpRemoteAddr}:${rtpRemotePort} " +
+                    "local=${rtpSocket.localAddress}:${rtpSocket.localPort}",
+            )
         } catch (t: Throwable) {
-            Rlog.e(logTag, "Failed to bind/connect incoming RTP socket", t)
+            Rlog.e(logTag, "Failed to bind incoming RTP socket", t)
             try { rtpSocket.close() } catch (_: Throwable) {}
-            reconnectIms("incoming RTP bind/connect failed")
+            reconnectIms("incoming RTP bind failed")
             return null
         }
-        Rlog.d(logTag, "RTP socket created: local=${rtpSocket.localAddress}:${rtpSocket.localPort}, remote=${rtpSocket.inetAddress}:${rtpSocket.port}")
+        Rlog.d(
+            logTag,
+            "RTP socket created: local=${rtpSocket.localAddress}:${rtpSocket.localPort}, " +
+                "connected=${rtpSocket.isConnected}, socketRemote=${rtpSocket.inetAddress}:${rtpSocket.port}, " +
+                "txTarget=${rtpRemoteAddr}:${rtpRemotePort}",
+        )
         return rtpSocket
     }
 
