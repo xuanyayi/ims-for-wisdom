@@ -183,6 +183,7 @@ class PhhMmTelFeature(
 
     companion object {
         private const val TAG = "PHH MmTelFeature"
+        private const val INVALID_SUBSCRIPTION_RETIRE_DELAY_MS = 5_000L
     }
 
     var telephonyManager: TelephonyManager? = null
@@ -191,6 +192,7 @@ class PhhMmTelFeature(
     private var readyCheckCallback: TelephonyCallback? = null
     private var readyCheckAttempts = 0
     private var frameworkSubId = initialSubId
+    private var invalidSubscriptionGraceGeneration = 0
     private var featureInitialized = false
 
     val imsSms = PhhImsSms(slotId)
@@ -371,6 +373,39 @@ class PhhMmTelFeature(
         }
     }
 
+    private fun scheduleInvalidSubscriptionRetireGrace(oldSubId: Int, reason: String) {
+        val generation = ++invalidSubscriptionGraceGeneration
+        Rlog.w(
+            TAG,
+            "$slotId delaying SipHandler retirement for transient invalid subscription: " +
+                "oldSubId=$oldSubId reason=$reason delayMs=$INVALID_SUBSCRIPTION_RETIRE_DELAY_MS",
+        )
+
+        readyCheckHandler.postDelayed({
+            if (generation != invalidSubscriptionGraceGeneration) {
+                Rlog.d(TAG, "$slotId invalid subscription grace cancelled for oldSubId=$oldSubId")
+                return@postDelayed
+            }
+
+            val recoveredSubId = resolveSubIdForSlot()
+            if (SubscriptionManager.isValidSubscriptionId(recoveredSubId)) {
+                Rlog.w(
+                    TAG,
+                    "$slotId subscription recovered during invalid-subId grace: " +
+                        "oldSubId=$oldSubId recoveredSubId=$recoveredSubId",
+                )
+                frameworkSubId = recoveredSubId
+                bindReadyCheckTelephonyManager("subscription recovered during invalid-subId grace")
+                return@postDelayed
+            }
+
+            unregisterReadyCheckCallback("service subscription invalid after grace")
+            retireSipHandler("subscription removed oldSubId=$oldSubId after invalid-subId grace")
+            featureState = STATE_INITIALIZING
+            bindReadyCheckTelephonyManager("service subscription invalid after grace")
+        }, INVALID_SUBSCRIPTION_RETIRE_DELAY_MS)
+    }
+
     fun onSubscriptionChangedFromService(subscriptionId: Int) {
         val oldFrameworkSubId = frameworkSubId
         frameworkSubId = subscriptionId
@@ -387,11 +422,26 @@ class PhhMmTelFeature(
         }
 
         if (!SubscriptionManager.isValidSubscriptionId(subscriptionId)) {
+            if (
+                this::sipHandler.isInitialized &&
+                SubscriptionManager.isValidSubscriptionId(sipHandlerSubId)
+            ) {
+                scheduleInvalidSubscriptionRetireGrace(
+                    oldSubId = sipHandlerSubId,
+                    reason = "service subscription invalid",
+                )
+                return
+            }
+
             unregisterReadyCheckCallback("service subscription invalid")
             retireSipHandler("subscription removed oldSubId=$sipHandlerSubId")
             featureState = STATE_INITIALIZING
             return
         }
+
+        // Cancel any pending invalid-subId retirement once telephony reports a
+        // valid subscription again.
+        invalidSubscriptionGraceGeneration++
 
         if (
             this::sipHandler.isInitialized &&
@@ -814,6 +864,7 @@ sipHandler.imsFailureCallback = {
     override fun onFeatureRemoved() {
         Rlog.d(TAG, "$slotId onFeatureRemoved")
 
+        invalidSubscriptionGraceGeneration++
         unregisterReadyCheckCallback("feature removed")
         retireSipHandler("feature removed")
 
