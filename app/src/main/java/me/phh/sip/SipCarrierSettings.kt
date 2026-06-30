@@ -113,6 +113,9 @@ data class SipCarrierPolicy(
             realm.equals(SINGTEL_STOCK_REALM, ignoreCase = true) ||
             registerTargetRealm.equals(SINGTEL_STOCK_REALM, ignoreCase = true)
 
+    fun useChinaUnicomCompactPolicy(): Boolean =
+        outgoingInviteShape == OutgoingInviteShape.CHINA_UNICOM_COMPACT_STOCK
+
     fun registerSecurityClientAlgs(realm: String, registerTargetRealm: String = realm): List<String> =
         if (useSingTelStockPolicy(realm, registerTargetRealm)) {
             listOf("hmac-sha-1-96")
@@ -167,6 +170,7 @@ data class SipCarrierPolicy(
     enum class OutgoingInviteShape {
         DEFAULT,
         SINGTEL_COMPACT_STOCK,
+        CHINA_UNICOM_COMPACT_STOCK,
     }
 
     companion object {
@@ -233,6 +237,13 @@ data class SipCarrierPolicy(
                     securityClientEalgs = listOf("null"),
                 )
 
+                "460001" -> defaultFor(mcc, mnc).copy(
+                    // China Unicom needs a compact outgoing INVITE and a
+                    // compact final precondition UPDATE body for VoLTE call
+                    // setup on the tested SIM.
+                    outgoingInviteShape = OutgoingInviteShape.CHINA_UNICOM_COMPACT_STOCK,
+                )
+
                 "208010" -> defaultFor(mcc, mnc).copy(
                     // 20810 can do TCP and UDP; force UDP for testing.
                     isControlSocketUdp = true,
@@ -291,6 +302,9 @@ data class SipCarrierSettings(
 
     fun useSingTelStockPolicy(realm: String, registerTargetRealm: String = realm): Boolean =
         policy.useSingTelStockPolicy(realm, registerTargetRealm)
+
+    fun useChinaUnicomCompactPolicy(): Boolean =
+        policy.useChinaUnicomCompactPolicy()
 
     fun registerSecurityClientAlgs(realm: String, registerTargetRealm: String = realm): List<String> =
         policy.registerSecurityClientAlgs(realm, registerTargetRealm)

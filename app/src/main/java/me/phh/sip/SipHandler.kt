@@ -2568,6 +2568,27 @@ fun onWfcDisabled(reason: String) {
             contact = contact,
         )
 
+    private fun compactChinaUnicomContact(): String {
+        val localEndpoint =
+            if (socket.gLocalAddr() is Inet6Address) {
+                "[${socket.gLocalAddr().hostAddress}]:${serverSocket.localPort}"
+            } else {
+                "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
+            }
+        return "<sip:$imsi@$localEndpoint;transport=${SipContactHeaders.transport(socket)}>"
+    }
+
+    private fun localDialogHeadersForChinaUnicomUpdate(call: Call): SipHeadersMap =
+        localDialogHeadersForRequest(call, SipMethod.UPDATE)
+            .filterKeys { key ->
+                !key.equals("content-length", ignoreCase = true) &&
+                    !key.equals("require", ignoreCase = true) &&
+                    !key.equals("contact", ignoreCase = true)
+            } + mapOf(
+                "contact" to listOf(compactChinaUnicomContact()),
+                "content-type" to listOf("application/sdp"),
+            )
+
     fun handleAck(request: SipRequest): Int {
         val callId = request.callIdOrEmpty()
         val call = currentCall
@@ -2659,6 +2680,7 @@ fun onWfcDisabled(reason: String) {
     private data class UpdateSdpAnswerState(
         val updatedCall: Call,
         val answerSdp: ByteArray,
+        val offerAttributes: List<String>,
     )
 
     private fun prepareUpdateSdpAnswer(
@@ -2721,6 +2743,44 @@ fun onWfcDisabled(reason: String) {
         return UpdateSdpAnswerState(
             updatedCall = updatedCall,
             answerSdp = answerSdp,
+            offerAttributes = attributes,
+        )
+    }
+
+    private fun sendChinaUnicomFinalPreconditionUpdateAfterRemoteUpdate(
+        call: Call,
+        offerAttributes: List<String>,
+    ) {
+        if (!call.outgoing || !useChinaUnicomStockOutgoingPolicy()) return
+        if (!call.chinaUnicomFinalPreconditionUpdateSent.compareAndSet(false, true)) {
+            Rlog.d(
+                TAG,
+                "Skipping duplicate China Unicom final precondition UPDATE callId=${call.callIdOrEmpty()}",
+            )
+            return
+        }
+
+        val callId = call.callIdOrEmpty()
+        val respSdp = offerAttributes.map { "a=$it" }
+        val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
+            respSdp = respSdp,
+            call = call,
+            remoteHasLocalQos = true,
+            compactChinaUnicom = true,
+            nextLocalSdpVersion = { call.localSdpVersion.incrementAndGet() },
+        )
+        val updateHeaders = localDialogHeadersForChinaUnicomUpdate(call)
+        val msg = SipOutgoingDialogSdp.buildPreconditionUpdateRequest(
+            remoteContact = call.remoteContact,
+            fallbackTarget = call.remoteContact,
+            updateHeaders = updateHeaders,
+            newSdp = newSdp,
+        )
+        Rlog.d(TAG, "Sending China Unicom final precondition UPDATE after remote UPDATE callId=$callId $msg")
+        writeSipBytesWithFlush(
+            socket.gWriter(),
+            "SipHandler china-unicom-final-update",
+            msg.toByteArray(),
         )
     }
 
@@ -2776,6 +2836,11 @@ fun onWfcDisabled(reason: String) {
             updatedCallId = updateSdpAnswerState.updatedCall.callIdOrEmpty(),
             answerSdp = updateSdpAnswerState.answerSdp,
             logTag = TAG,
+        )
+
+        sendChinaUnicomFinalPreconditionUpdateAfterRemoteUpdate(
+            call = updateSdpAnswerState.updatedCall,
+            offerAttributes = updateSdpAnswerState.offerAttributes,
         )
 
         return 0
@@ -3050,7 +3115,11 @@ fun onWfcDisabled(reason: String) {
         val remoteContact: String,
         val incomingResponseWriter: OutputStream? = null,
         val localCseq: AtomicInteger = AtomicInteger(2),
-        val localSdpVersion: AtomicInteger = AtomicInteger(2), val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false), val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false), )
+        val localSdpVersion: AtomicInteger = AtomicInteger(2),
+        val outgoingRtpReceived: AtomicBoolean = AtomicBoolean(false),
+        val outgoingConnectedNotified: AtomicBoolean = AtomicBoolean(false),
+        val chinaUnicomFinalPreconditionUpdateSent: AtomicBoolean = AtomicBoolean(false),
+    )
 
     private data class PendingWaitingInvite(
         val callId: String,
@@ -4178,6 +4247,9 @@ fun onWfcDisabled(reason: String) {
     private fun useSingTelStockOutgoingPolicy(): Boolean =
         carrierSettings.useSingTelStockPolicy(realm, registerTargetRealm)
 
+    private fun useChinaUnicomStockOutgoingPolicy(): Boolean =
+        carrierSettings.useChinaUnicomCompactPolicy()
+
     private fun createOutgoingCallRtpSocket(): DatagramSocket? {
         val rtpSocket = try {
             DatagramSocket(0, localAddr)
@@ -4221,6 +4293,7 @@ fun onWfcDisabled(reason: String) {
             ipType = if (localAddr is Inet6Address) "IP6" else "IP4",
             amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
             singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
+            chinaUnicomStockOutgoingCarrier = useChinaUnicomStockOutgoingPolicy(),
         )
     }
 
@@ -4257,6 +4330,7 @@ fun onWfcDisabled(reason: String) {
             minSeSeconds = outgoingInviteSessionTimer.minSeSeconds,
             generatedCallIdHeaders = generateCallId(),
             singtelStockOutgoingCarrier = useSingTelStockOutgoingPolicy(),
+            chinaUnicomStockOutgoingCarrier = useChinaUnicomStockOutgoingPolicy(),
             singtelPublicSipUri = { number -> carrierSettings.singtelPublicSipUri(number) },
         )
     }
@@ -4664,8 +4738,9 @@ fun onWfcDisabled(reason: String) {
         rtpSocket: DatagramSocket,
         answer: OutgoingDialogSdpAnswer,
         nextLocalCseqForDialog: Int,
-    ): Call =
-        Call(
+    ): Call {
+        val previousOutgoingDialogCall = currentCall
+        return Call(
             outgoing = true,
             audioCodec = answer.dialogAudioCodec,
             amrTrack = answer.dialogAmrTrack,
@@ -4686,7 +4761,10 @@ fun onWfcDisabled(reason: String) {
             hasEarlyMedia = response.headers["p-early-media"]?.isNotEmpty() == true,
             remoteContact = extractDestinationFromContact(response.headers["contact"]!![0]),
             localCseq = AtomicInteger(nextLocalCseqForDialog),
+            chinaUnicomFinalPreconditionUpdateSent =
+                previousOutgoingDialogCall?.chinaUnicomFinalPreconditionUpdateSent ?: AtomicBoolean(false),
         )
+    }
 
 
     private fun logOutgoingDialogSdpInstall(
@@ -4882,15 +4960,20 @@ fun onWfcDisabled(reason: String) {
             }
 
             val newSdp = SipOutgoingDialogSdp.buildPreconditionUpdateSdp(
-                originalInviteSdp = originalInviteSdp,
                 respSdp = respSdp,
+                call = currentCall!!,
                 remoteHasLocalQos = remoteHasLocalQos,
+                compactChinaUnicom = useChinaUnicomStockOutgoingPolicy(),
                 nextLocalSdpVersion = { currentCall?.localSdpVersion?.incrementAndGet() ?: 3 },
             )
 
-            val updateHeaders = localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE) -
-                "content-length" +
-                ("content-type" to listOf("application/sdp"))
+            val updateHeaders = if (useChinaUnicomStockOutgoingPolicy()) {
+                localDialogHeadersForChinaUnicomUpdate(currentCall!!)
+            } else {
+                localDialogHeadersForRequest(currentCall!!, SipMethod.UPDATE)
+                    .filterKeys { key -> !key.equals("content-length", ignoreCase = true) } +
+                    mapOf("content-type" to listOf("application/sdp"))
+            }
 
             val msg2 = SipOutgoingDialogSdp.buildPreconditionUpdateRequest(
                 remoteContact = currentCall!!.remoteContact,
