@@ -213,51 +213,6 @@ internal object SipUpdateSdpAnswerNegotiator {
 }
 
 internal object SipUpdateSdpAnswerBuilder {
-    private fun hasQosSide(line: String, side: String): Boolean =
-        line.split("\\s+".toRegex()).any { it.equals(side, ignoreCase = true) }
-
-    private fun mirrorQosPerspective(line: String, from: String, to: String): String =
-        line.split("\\s+".toRegex())
-            .map { token -> if (token.equals(from, ignoreCase = true)) to else token }
-            .joinToString(" ")
-
-    private fun qosAnswerLines(attributes: List<String>): List<String> {
-        val hasPrecondition = attributes.any { attr ->
-            attr.startsWith("curr:qos", ignoreCase = true) ||
-                attr.startsWith("des:qos", ignoreCase = true) ||
-                attr.startsWith("conf:qos", ignoreCase = true)
-        }
-        if (!hasPrecondition) return emptyList()
-
-        val offerCurrentLocal = attributes.firstOrNull {
-            it.startsWith("curr:qos", ignoreCase = true) && hasQosSide(it, "local")
-        }
-        val offerDesiredLocal = attributes.firstOrNull {
-            it.startsWith("des:qos", ignoreCase = true) && hasQosSide(it, "local")
-        }
-        val offerDesiredRemote = attributes.firstOrNull {
-            it.startsWith("des:qos", ignoreCase = true) && hasQosSide(it, "remote")
-        }
-
-        val currentRemote = offerCurrentLocal
-            ?.let { mirrorQosPerspective(it, from = "local", to = "remote") }
-            ?: "curr:qos remote sendrecv"
-        val desiredLocal = offerDesiredRemote
-            ?.let { mirrorQosPerspective(it, from = "remote", to = "local") }
-            ?: "des:qos mandatory local sendrecv"
-        val desiredRemote = offerDesiredLocal
-            ?.let { mirrorQosPerspective(it, from = "local", to = "remote") }
-            ?: "des:qos mandatory remote sendrecv"
-
-        return listOf(
-            "a=curr:qos local sendrecv",
-            "a=$currentRemote",
-            "a=$desiredLocal",
-            "a=$desiredRemote",
-            "a=conf:qos remote sendrecv",
-        )
-    }
-
     fun build(
         request: SipRequest,
         call: SipHandler.Call,
@@ -272,20 +227,14 @@ internal object SipUpdateSdpAnswerBuilder {
         val selectedAudioCodec = call.audioCodec
         val allTracks = listOf(amrTrack, dtmfTrack)
         val ipType = if (localAddr is Inet6Address) "IP6" else "IP4"
+        val owner = request.destination.substringAfter("sip:").substringBefore("@").ifBlank { "-" }
         val sdpVersion = call.localSdpVersion.incrementAndGet()
-        val remotePtime = attributes.firstOrNull { it.startsWith("ptime:") } ?: "ptime:20"
         val remoteMaxptime = attributes.firstOrNull { it.startsWith("maxptime:") } ?: "maxptime:240"
-        val dtmfFmtpAnswer = attributes.firstOrNull { it.startsWith("fmtp:$dtmfTrack") }
-            ?: "fmtp:$dtmfTrack 0-15"
-        val contentLines = attributes
-            .filter { it.startsWith("content:", ignoreCase = true) }
-            .map { "a=$it" }
-        val qosLines = qosAnswerLines(attributes)
         val sdpBandwidthAs = SipAudioCodecNegotiator.sdpBandwidthAsKbps(selectedAudioCodec)
 
-        val answerSdpLines = mutableListOf(
+        val answerSdpLines = listOf(
             "v=0",
-            "o=- 1 $sdpVersion IN $ipType ${localAddr.hostAddress}",
+            "o=$owner 1 $sdpVersion IN $ipType ${localAddr.hostAddress}",
             "s=phh voice call",
             "c=IN $ipType ${localAddr.hostAddress}",
             "b=AS:$sdpBandwidthAs",
@@ -297,17 +246,20 @@ internal object SipUpdateSdpAnswerBuilder {
             "b=RS:0",
             "b=RR:0",
             "a=$amrTrackDesc",
-            "a=$remotePtime",
+            "a=ptime:20",
             "a=$remoteMaxptime",
             "a=$dtmfTrackDesc",
             "a=$amrFmtpAnswer",
-            "a=$dtmfFmtpAnswer",
+            "a=fmtp:$dtmfTrack 0-15",
+            "a=curr:qos local sendrecv",
+            "a=curr:qos remote sendrecv",
+            "a=des:qos mandatory local sendrecv",
+            "a=des:qos mandatory remote sendrecv",
+            "a=conf:qos remote sendrecv",
+            "a=sendrecv",
         )
-        answerSdpLines += contentLines
-        answerSdpLines += qosLines
-        answerSdpLines += "a=sendrecv"
 
-        return (answerSdpLines.joinToString("\r\n") + "\r\n").toByteArray(Charsets.US_ASCII)
+        return answerSdpLines.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
     }
 }
 

@@ -73,26 +73,36 @@ internal object ImsNetworkState {
 
     fun resolveEndpoint(
         tag: String,
-        network: Network,
         lp: LinkProperties,
         mnc: String,
         mcc: String,
-        mncDiscoveryCandidates: List<String>,
-        isimPcscfCandidates: List<String>,
-        preferUdp: Boolean,
+        preferredPcscf: InetAddress? = null,
     ): ImsNetworkEndpointResolution {
         val pcscfs = getPcscfServers(lp)
-        val pcscf = if (pcscfs.isNotEmpty()) {
+        val pcscf = preferredPcscf ?: if (pcscfs.isNotEmpty()) {
             pcscfs[0]
         } else {
-            val dnsFallback = resolveFallbackPcscf(
-                tag,
-                network,
-                listOf(mnc) + mncDiscoveryCandidates,
-                mcc,
-                isimPcscfCandidates,
-                preferUdp,
-            )
+            // RIL did not provide P-CSCF via LinkProperties. Try standard
+            // 3GPP DNS discovery (TS 23.003 §13.2): resolve the well-known
+            // IMS domain for this PLMN.
+            val dnsFallback = try {
+                InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
+            } catch (t: Throwable) {
+                null
+            } ?: try {
+                InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
+            } catch (t: Throwable) {
+                null
+            } ?: android.os.SystemProperties
+                .get("persist.ims.pcscf_fallback", "")
+                .takeIf { it.isNotEmpty() }
+                ?.let {
+                    try {
+                        InetAddress.getByName(it)
+                    } catch (t: Throwable) {
+                        null
+                    }
+                }
 
             if (dnsFallback != null) {
                 Rlog.w(tag, "No P-CSCF from RIL, using fallback: $dnsFallback")
@@ -110,72 +120,6 @@ internal object ImsNetworkState {
         }
 
         return ImsNetworkEndpointResolution.Success(pcscf, localAddr)
-    }
-
-    private fun resolveFallbackPcscf(
-        tag: String,
-        network: Network,
-        mncCandidates: List<String>,
-        mcc: String,
-        isimPcscfCandidates: List<String>,
-        preferUdp: Boolean,
-    ): InetAddress? {
-        val normalizedMncCandidates = mncCandidates
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-
-        val discoveredPcscfs = try {
-            ImsDnsDiscovery.discoverPcscf(tag, network, normalizedMncCandidates, mcc, preferUdp)
-        } catch (t: Throwable) {
-            Rlog.w(tag, "P-CSCF DNS discovery failed", t)
-            emptyList()
-        }
-
-        if (discoveredPcscfs.isNotEmpty()) {
-            Rlog.w(tag, "P-CSCF DNS discovery returned addresses=$discoveredPcscfs")
-            return discoveredPcscfs[0]
-        }
-
-        val candidates = buildList {
-            addAll(isimPcscfCandidates)
-            for (mnc in normalizedMncCandidates) {
-                add("pcscf.ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
-                add("pcscf.ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
-                add("pcscf.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
-                add("pcscf.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
-                add("p-cscf.ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
-                add("p-cscf.ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
-                add("ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org")
-                add("ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org")
-            }
-            android.os.SystemProperties
-                .get("persist.ims.pcscf_fallback", "")
-                .split(',')
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .forEach { add(it) }
-        }.distinct()
-
-        for (candidate in candidates) {
-            val resolved = try {
-                network.getAllByName(candidate)
-            } catch (t: Throwable) {
-                Rlog.w(tag, "P-CSCF fallback resolve failed candidate=$candidate", t)
-                emptyArray()
-            }
-                .filter { !it.isAnyLocalAddress && !it.isLoopbackAddress }
-                .sortedBy { if (it is Inet6Address) 0 else 1 }
-
-            if (resolved.isNotEmpty()) {
-                Rlog.w(tag, "P-CSCF fallback resolved candidate=$candidate addresses=$resolved")
-                return resolved[0]
-            }
-
-            Rlog.w(tag, "P-CSCF fallback returned no usable address candidate=$candidate")
-        }
-
-        return null
     }
 
     fun ratName(rat: Int): String =

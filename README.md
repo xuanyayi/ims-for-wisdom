@@ -1,13 +1,14 @@
-# PhhIms - VoLTE/VoWiFi for LineageOS on Samsung Exynos devices
+# PhhIms - VoLTE/VoWiFi for LineageOS on Samsung devices
 
 Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims) and the Samsung-focused fork history from [amikhasenko/ims](https://github.com/amikhasenko/ims).
 
-This fork is used as a privileged userspace `ImsService` / MmTel provider for Samsung Exynos devices where the vendor IMS stack is missing, unusable, or not practical to port to current LineageOS releases.
+This fork is used as a privileged userspace `ImsService` / MmTel provider for Samsung devices where the vendor IMS stack is missing, unusable, or not practical to port to current LineageOS releases.
 
-The current tested focus is Samsung Exynos LineageOS 23.x / Android 16 bring-up:
+The current tested focus is Samsung LineageOS 23.x / Android 16 bring-up across both Exynos and Qualcomm Snapdragon devices:
 
 - Samsung Galaxy S9 / S9+ / Note9 / Exynos9810 (`starlte`, `star2lte`, `crownlte`)
 - Samsung Galaxy S20 / S20+ / S20 Ultra / Exynos9830 (`x1s`, `y2s`, `z3s` family; current testing mainly `x1s`)
+- Samsung Galaxy S23 Ultra / Qualcomm Snapdragon 8 Gen 2 / SM8550 (`dm1q`)
 - O2 Germany / Telefónica Germany family as the main known-good carrier test environment
 
 This is not a universal drop-in IMS replacement. It still depends on carrier provisioning, Samsung RIL behavior, correct Android telephony overlays, CarrierConfig, sepolicy, audio HAL behavior, and ROM-side integration.
@@ -36,12 +37,12 @@ a generic certified carrier IMS implementation.
 
 | Area | Status |
 | --- | --- |
-| IMS registration | Working in current Exynos9810 and Exynos9830 tests, including AKA/IPsec registration, P-CSCF fallback, REGISTER retry/reconnect handling, 494 fallback handling, and stale IMS bearer recovery. |
-| VoLTE outgoing calls | Working in tested configs, including Android call UI progress, SIP setup, PRACK/session-timer handling, RTP, AMR-NB/AMR-WB negotiation, DTMF, BYE handling, and two-way audio when ROM-side audio fixes are present. |
+| IMS registration | Working in current Exynos9810, Exynos9830, and Snapdragon dm1q tests, including AKA/IPsec registration, P-CSCF fallback, temporary P-CSCF failure recovery, REGISTER retry/reconnect handling, 494 fallback handling, transient SIP reconnect handling, invalid-subscription debounce, and stale IMS bearer recovery. |
+| VoLTE outgoing calls | Working in tested configs, including Android call UI progress, SIP setup, PRACK/session-timer handling, RTP, AMR-NB/AMR-WB negotiation, DTMF, BYE handling, carrier-policy-backed retry hooks, short-code handling, emergency-number guardrails, and two-way audio when ROM-side audio fixes are present. |
 | VoLTE incoming calls | Working in current tests for accept, local end, remote end, reject, duplicate INVITE, CANCEL, and precondition call paths. Re-test after every dialog/call-state change. |
-| VoWiFi | Working in current testing. IWLAN/LTE route changes still depend heavily on QNS, CarrierConfig, WFC mode, service state, and Samsung RIL behaviour. |
+| VoWiFi | Working in current testing on Exynos and Snapdragon targets. IWLAN/LTE route changes still depend heavily on QNS, CarrierConfig, WFC mode, service state, and Samsung RIL behaviour. Cellular/mobile-preferred WFC must still allow calls over IWLAN when the device is currently registered through VoWiFi. |
 | Active VoLTE ↔ VoWiFi switching | Current code defers unsafe tech-only IMS reconnects while a call is active/pending or while media threads are still running. This avoids killing RTP and leaving a fake silent call. Phone-info may still show the original registration tech until the call ends. |
-| SMS over IMS | Basic send/receive path tested. IMS MESSAGE success now waits for RP-layer result where needed. Carrier-specific SMSC and fallback quirks may still need testing. |
+| SMS over IMS | Basic send/receive path tested. IMS MESSAGE success now waits for RP-layer result where needed. SMS fallback status codes, fallback cooldown, RP result timeout, and carrier-specific SMSC quirks are policy-driven. |
 | Audio | SIP/RTP media is handled in userspace, but working microphone/earpiece routing still depends on ROM-side Samsung audio HAL fixes and mixer routing. |
 | USSD/MMI | IMS UT/USSD is not the current goal. Potential USSD/MMI requests are routed over CS when IMS UT/USSD is unavailable. |
 | Video calling / RCS / UT | Not a goal for now. Voice and basic SMS are the focus. |
@@ -58,6 +59,35 @@ call starts, so telephony uses circuit-switched fallback and the modem may drop
 to GSM/EDGE during the call. In that case, inspect IMS network acquisition,
 P-CSCF discovery, SIP REGISTER, 401 challenge handling, and reconnect retry
 behaviour before assuming the SIP call path failed.
+
+
+## Recent carrier-policy and recovery changes
+
+Carrier-specific SIP behavior is now collected in `SipCarrierPolicy` /
+`SipCarrierSettings` instead of being scattered across REGISTER, outgoing INVITE,
+SMS, and dial-string call paths. The current in-code policy table is intentionally
+small and can later become an XML/resource-backed carrier config once the policy
+surface stabilizes.
+
+The current policy model covers:
+
+- REGISTER extra headers and optional reg-event `SUBSCRIBE` behavior
+- carrier service-code CSFB and plain `tel:` short-code exceptions
+- local short-code `phone-context` generation
+- emergency-like dial-string guardrails for the normal MMTel path
+- outgoing PANI policy
+- SingTel-style compact outgoing INVITE/SMS/security behavior
+- P-CSCF registration recovery and transient SIP reconnect handling
+- SMS fallback status codes, fallback cooldown, and RP result wait timeout
+- outgoing INVITE retry/recovery hooks such as 422 retry, illegal-SDP retry,
+  and SIP auth/security reconnect handling
+
+Registration recovery now temporarily skips a failed advertised P-CSCF when
+alternate P-CSCF addresses are available, keeps framework IMS registration stable
+during short controlled SIP transport reconnects, and debounces transient
+`subId=-1` updates during radio/subscription churn before retiring the active
+`SipHandler`.
+
 
 ## Important Samsung-specific background
 
@@ -88,6 +118,57 @@ The code has been iterated around these problem areas:
 - call cleanup after BYE/CANCEL/network failure
 - SMS-over-IMS plumbing and RP-layer result handling
 
+
+## Known carrier test/status notes
+
+Carrier status below is based on community and test-device logs for this fork.
+It is not a carrier certification list and should not be read as a guarantee
+that every SIM/device combination on the same network will be provisioned for
+IMS.
+
+### Known-good / actively tested paths
+
+| Carrier / environment | PLMN / numeric | Current notes |
+| --- | --- | --- |
+| O2 Germany / Telefónica Germany family | `26203` / normalized `262003` | Main known-good environment. Used for Exynos9810, Exynos9830, and dm1q testing across IMS registration, VoLTE, VoWiFi, SMS-over-IMS, WFC/IWLAN transitions, P-CSCF fallback/recovery, and reconnect handling. O2/Fonic-family paths have also been validated on S20/x1s bring-up builds. |
+| Congstar / Telekom Germany | Telekom Germany MVNO | S20/x1s tests showed IMS registration, landline/mobile calls, VoWiFi mobile calls, and normal day-to-day behavior working smoothly. Congstar-alone testing was marked good. |
+| Fonic / O2 Germany MVNO | O2 Germany MVNO | O2/Fonic-family tests are treated as working. Earlier SMS/debug logs were useful for dual-SIM/subscription and RP-layer fallback handling. |
+| Swiss / border-carrier test set | Swiss and German networks | CH/DE border-location tests included Congstar, fraenk, O2, Migros, Salt, and related Swiss-side network behavior. Treat this set as working from the tester perspective, while still rechecking roaming/WFC/border-cell behavior when touching subscription, QNS, or WFC policy. |
+| Talkmobile / Vodafone UK | Vodafone UK MVNO | Tested through VoLTE/VoWiFi call logs. Required media renegotiation fixes for early `183 Session Progress` AMR-NB followed by final `200 OK` AMR-WB SDP. |
+| A1 Croatia | `21910` / normalized `219010` | Tested carrier-policy exception. Needs stock-like REGISTER access-network headers and does not require the optional reg-event `SUBSCRIBE` before IMS voice can be considered ready. |
+| Vodafone Turkey | `28602` / normalized `286002` | Tested carrier-policy exception. Short service code `542` is kept as plain `tel:542`, and outgoing INVITE needs access-tech PANI. |
+| SingTel Singapore | `52501` / normalized `525001` | Carrier-policy exception for stock-like compact outgoing INVITE/SMS/security behavior, including SingTel SMSC handling. Some test SIMs may be data-only, so do not treat every 52501 SIM as a full voice IMS validation. |
+
+### Carrier-specific policy exceptions currently modeled
+
+| PLMN / numeric | Carrier / use | Policy behavior |
+| --- | --- | --- |
+| `219010` | A1 Croatia | REGISTER extra access-network headers; skip reg-event `SUBSCRIBE` requirement. |
+| `232005` | 3 Austria | Service code `333` is forced to CSFB instead of building a normal IMS INVITE. |
+| `286002` | Vodafone Turkey | Plain `tel:` short-code handling for configured local service codes; outgoing access-tech PANI. |
+| `450006` | LG U+ Korea | UDP control socket and non-session AKA policy. |
+| `525001` | SingTel Singapore | Stock-like compact outgoing INVITE/SMS/security shape and SingTel SMSC handling. |
+| `208010` | Test carrier profile | UDP control socket test profile. |
+
+### Partial / reference carrier logs
+
+These carriers have useful logs or stock-reference behavior in the development
+history, but should not be listed as fully known-good unless current PhhIms logs
+show registration, outgoing call, incoming call, SMS, and reconnect behavior on
+the target device:
+
+| Carrier / environment | PLMN / numeric | Current notes |
+| --- | --- | --- |
+| Telekom / T-Mobile Poland | `26002` | Stock Samsung profile shows IMS registered with `mmtel` and `smsip`; PhhIms logs were used for outgoing INVITE-shape debugging. |
+| Jio India | carrier-specific PLMN varies | Active interoperability target, especially incoming VoLTE behavior. Keep this as test/bring-up unless current logs prove the full path. |
+| Airtel India | carrier-specific PLMN varies | Test/bring-up target; keep carrier behavior policy-driven. |
+| Jazz Pakistan | carrier-specific PLMN varies | Test/bring-up target; keep carrier behavior policy-driven. |
+
+When adding a new carrier entry, prefer adding policy data to `SipCarrierPolicy`
+instead of adding new MCC/MNC checks in `SipHandler`, `SipSmsHandler`, or
+outgoing INVITE builders.
+
+
 ## Source layout notes
 
 The SIP stack is intentionally split into topic-specific helper files. Small
@@ -100,6 +181,7 @@ Important groups:
 - `SipOutgoingInvite*`, `SipIncomingInvite*`, `SipInDialogInvite`, `SipUpdate*`, and `SipRemoteDialogTermination` handle call signalling.
 - `SipAudio*`, `SipUplink*`, `SipDownlink*`, `SipAmrRtpPayload`, and `SipRtp*` handle userspace media and RTP helpers.
 - `ImsNetwork*`, `ImsReconnectController`, `ImsTransportGuard`, and `WfcSubscriptionSettingMonitor` handle IMS bearer and VoWiFi/VoLTE access changes.
+- `SipCarrierSettings`, `SipSmsFallbackPolicy`, and `SipOutgoingInviteRetryPolicy` hold carrier-policy-backed behavior for carrier exceptions, SMS fallback, and outgoing call retry/recovery decisions.
 - `SipSmsHandler`, `Sms`, and `SmscAddress` handle SMS-over-IMS.
 
 Keep behavioural fixes, carrier policy changes, audio/media changes, and pure
@@ -150,7 +232,7 @@ PRODUCT_PACKAGES += \
 
 ## Device tree integration
 
-The exact paths differ per tree, but current Samsung Exynos9810 / Exynos9830 integration usually needs the following pieces.
+The exact paths differ per tree, but current Samsung Exynos and Qualcomm Snapdragon integration usually needs the following pieces.
 
 ### Packages
 
@@ -271,7 +353,7 @@ Known ROM-side pieces used in current testing:
 - Bind `me.phh.ims` as the MmTel provider through the Telephony overlay.
 - Expose VoLTE/VoWiFi capability through framework overlays and carrier config.
 - Carry a CarrierConfig overlay for the tested carrier. For Telefónica Germany family testing this includes deterministic WFC availability and IWLAN behavior.
-- Use ROM-side audio HAL fixes where needed. The current Exynos9810 audio bring-up uses an `EXYNOS9810_CALLVOL_FIX` Soong flag in the Samsung audio HAL to map Android call volume to the Samsung receiver gain mixer control.
+- Use ROM-side audio HAL and mixer fixes where needed. The old `EXYNOS9810_CALLVOL_FIX` Soong flag is deprecated and is no longer used by current bring-up trees.
 - Keep Samsung RIL / IMS property sepolicy in sync if your tree exposes `vendor.ril.ims.*` properties.
 
 Validation checklist used for Exynos9810:
@@ -311,13 +393,39 @@ Validation checklist used for Exynos9830:
 
 ## Samsung audio notes
 
+## Qualcomm Snapdragon / dm1q integration notes
+
+Current Snapdragon testing covers the Galaxy S23 Ultra (`dm1q`, SM8550 / Qualcomm Snapdragon 8 Gen 2 class) on LineageOS 23.x.
+
+Known ROM-side pieces used in current testing:
+
+- Add `PhhIms`, `Iwlan`, and `QualifiedNetworksService` to the product packages.
+- Bind `me.phh.ims` as the MmTel provider.
+- Expose VoLTE/VoWiFi capability through framework overlays and carrier config.
+- Keep Qualcomm RIL, QNS, IWLAN, and CarrierConfig behavior aligned with the device tree's IMS data-service setup.
+- Use carrier config for WFC availability/defaults and IWLAN handover behavior.
+- Be aware that mobile/cellular-preferred WFC is not cellular-only. If QNS/the modem currently has a valid IWLAN IMS registration, outgoing calls should be allowed over VoWiFi instead of being blocked while waiting for a cellular IMS path.
+- Snapdragon audio routing is still ROM/HAL dependent. SIP/RTP may be correct even when microphone gain, speaker/earpiece routing, or call-volume behavior needs device-side audio fixes.
+
+Validation checklist used for dm1q:
+
+- IMS registers on LTE and IWLAN.
+- Outgoing and incoming calls work on VoLTE and VoWiFi.
+- Mobile-preferred WFC allows calls when the active IMS registration is currently IWLAN.
+- Airplane-mode and radio-service churn do not permanently lose IMS registration.
+- Temporary invalid subscription updates do not immediately retire the active SIP handler.
+- P-CSCF recovery does not regress normal registration and can select an alternate advertised P-CSCF after a failed registration/connect attempt.
+- AMR-NB fallback, AMR-WB negotiation, DTMF, and dialog SDP media changes are checked where possible.
+- Audio routing, microphone gain, and speaker/earpiece behavior are validated separately from SIP/RTP success.
+
+
 Audio is not solved only inside this app. Samsung HALs often special-case cellular calls and may route capture/playback through modem/baseband paths instead of normal userspace audio paths.
 
-### Exynos9810 / S9 family
+### Device-side audio integration
 
-The Exynos9810 LineageOS 23.x bring-up uses a ROM-side audio HAL change guarded by an `EXYNOS9810_CALLVOL_FIX` Soong flag. That fix maps Android voice-call volume to the Samsung mixer control `Rcv Digital Gain`, so the in-call earpiece volume follows the Android call volume slider.
+Current bring-up trees handle call-volume and mixer routing in the ROM/audio HAL integration directly. The old `EXYNOS9810_CALLVOL_FIX` Soong flag is deprecated and is no longer used.
 
-This is not part of this app directly, but without the matching ROM-side audio fixes, the SIP/IMS stack may register and place calls while audio behavior still looks broken.
+This is not part of this app directly, but without matching ROM-side audio fixes, the SIP/IMS stack may register and place calls while audio behavior still looks broken. Validate microphone gain, speaker/earpiece routing, and call-volume behavior per device family.
 
 ### Telecom audio mode
 
@@ -380,6 +488,24 @@ Check:
 
 Usually means the app or framework still believes an old IMS access/network is valid.
 
+
+### IMS deregisters during brief `subId=-1` / PLMN `000000` churn
+
+During airplane-mode, radio, or SIM-service churn, telephony can briefly expose
+an invalid subscription even though the SIM and modem recover shortly after. The
+app should debounce this before retiring the active SIP handler.
+
+Useful logs:
+
+```text
+delaying SipHandler retirement for transient invalid subscription
+subscription recovered during invalid-subId grace
+subscription removed oldSubId=... after invalid-subId grace
+```
+
+Immediate SIP handler retirement is still expected for real feature removal or a
+real subscription removal that does not recover during the grace window.
+
 Check:
 
 - IWLAN/LTE registration tech reported to `ImsRegistrationImplBase`
@@ -387,6 +513,24 @@ Check:
 - stale `NetworkCallback` state
 - reconnect/re-request of the IMS bearer after access becomes unsuitable
 - whether the switch was only a tech-only LTE/IWLAN change with unchanged network/local address/P-CSCF
+
+
+### Mobile-preferred WFC rejects calls while registered on IWLAN
+
+Mobile/cellular-preferred WFC is not cellular-only. If Android/QNS currently
+selected IWLAN and the app is registered over VoWiFi, outgoing calls should be
+allowed over that IWLAN registration. Do not reject the call just because the
+user-facing WFC mode says mobile preferred.
+
+Check logs for:
+
+```text
+Rejecting outgoing call while waiting for required IMS access
+preferred=cellular tech=IWLAN
+```
+
+That indicates the access-convergence guard is too strict for mobile-preferred
+WFC and should allow IWLAN fallback when the current IMS registration is valid.
 
 ### Active call goes silent after LTE ↔ IWLAN switch
 
@@ -468,6 +612,12 @@ If SIP says the call is established but audio is broken, check:
 ## P-CSCF fallback
 
 If the RIL does not report P-CSCF addresses via `LinkProperties`, the app attempts standard 3GPP DNS discovery:
+
+If multiple P-CSCF addresses are advertised, registration recovery can
+temporarily skip a P-CSCF that failed connect/register and try another advertised
+address before falling back to a full IMS network retry. This is intentionally
+short-lived and only active when alternates are available.
+
 
 ```text
 ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org

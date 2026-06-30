@@ -13,6 +13,7 @@ internal class SipSmsHandler(
     private val tag: String,
     private val ctxt: Context,
     private val subId: Int,
+    private val carrierSettings: SipCarrierSettings,
     private val realmProvider: () -> String,
     private val commonHeadersProvider: () -> SipHeadersMap,
     private val mySipProvider: () -> String,
@@ -58,7 +59,7 @@ internal class SipSmsHandler(
             pendingOutgoingSmsByRef[pending.ref] = pending
         }
 
-        timeoutScheduler(15_000L) {
+        timeoutScheduler(carrierSettings.smsPolicy.rpResultWaitMs) {
             val expired = smsLock.withLock {
                 pendingOutgoingSmsByCallId.remove(callId)?.also {
                     pendingOutgoingSmsByRef.remove(it.ref)
@@ -268,8 +269,7 @@ internal class SipSmsHandler(
          * ims.singtel.com realm. Decode framework-provided PDU SMSC addresses
          * before building both RP-DATA and the SIP MESSAGE target.
          */
-        val isSingTelSms = realm.equals("ims.mnc001.mcc525.3gppnetwork.org", ignoreCase = true) ||
-            realm.equals("ims.singtel.com", ignoreCase = true)
+        val useSingTelSmsPolicy = carrierSettings.useSingTelStockPolicy(realm)
 
         fun decodeSingTelSmscPduAddress(value: String?): String? {
             val raw = value
@@ -336,15 +336,7 @@ internal class SipSmsHandler(
             }
         }
 
-        val smsc = if (isSingTelSms) {
-            /*
-             * Use the stock SingTel IMS SMSC. Other discovered/framework SMSC
-             * values can be accepted by SIP routing but rejected at RP level.
-             */
-            "+6596197777"
-        } else {
-            rawSmsc
-        }
+        val smsc = if (useSingTelSmsPolicy) carrierSettings.singtelSmsc() else rawSmsc
 
         // RP-DATA destination address. Passing an empty string makes
         // PhoneNumberUtils.numberToCalledPartyBCD("") return null and crashes
@@ -354,18 +346,9 @@ internal class SipSmsHandler(
         Rlog.d(tag, "sending sms ${data.toHex()} to rawSmsc=$rawSmsc smsc=$smsc rpSmsc=$rpSmsc")
 
         val smscSipIdentity = smscIdentity?.toString()?.let { normalizeSipTarget(it) }
-        val singtelSmscUri = smsc?.let { "sip:${if (it.startsWith("+")) it else "+$it"}@ims.singtel.com" }
-        val requestUri = if (isSingTelSms) {
-            singtelSmscUri ?: "sip:ims.singtel.com"
-        } else {
-            smscSipIdentity ?: "sip:$realm"
-        }
-        val dest = if (isSingTelSms) {
-            requestUri
-        } else {
-            smscSipIdentity ?: smsc?.let { "sip:+$it@$realm" } ?: "sip:$realm"
-        }
-        if (isSingTelSms) {
+        val requestUri = carrierSettings.smsRequestUri(realm, smsc, smscSipIdentity)
+        val dest = carrierSettings.smsToUri(realm, requestUri, smsc, smscSipIdentity)
+        if (useSingTelSmsPolicy) {
             Rlog.d(tag, "Using SingTel IMS SMS target requestUri=$requestUri dest=$dest rawSmsc=$rawSmsc smsc=$smsc rpSmsc=$rpSmsc")
         }
 

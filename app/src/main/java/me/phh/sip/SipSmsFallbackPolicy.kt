@@ -11,7 +11,7 @@ import android.telephony.Rlog
  */
 class SipSmsFallbackPolicy(
     private val tag: String,
-    private val cooldownMs: Long = 30L * 60L * 1000L,
+    private val policy: SipSmsPolicy = SipSmsPolicy(),
 ) {
     private val fallbackUntilByRealm = mutableMapOf<String, Long>()
 
@@ -19,10 +19,10 @@ class SipSmsFallbackPolicy(
         // Only learn fallback from terminal MESSAGE-level failures before an RP
         // result arrives. These cover common SBC/core denials and unsupported
         // MESSAGE shapes without permanently disabling SMS-over-IMS.
-        if (statusCode !in setOf(403, 404, 405, 408, 480, 488, 500, 501, 503, 603)) return
+        if (statusCode !in policy.fallbackSipStatusCodes) return
 
         val key = normalizedRealm(realm)
-        val until = System.currentTimeMillis() + cooldownMs
+        val until = System.currentTimeMillis() + policy.fallbackCooldownMs
         fallbackUntilByRealm[key] = until
         Rlog.w(
             tag,

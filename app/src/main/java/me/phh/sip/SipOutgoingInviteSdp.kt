@@ -28,8 +28,6 @@ internal object SipOutgoingInviteSdp {
         ipType: String,
         amrWbMediaCodecAvailable: Boolean,
         singtelStockOutgoingCarrier: Boolean,
-        compactProtectedOutgoingInvite: Boolean,
-        chinaUnicomStockOutgoingCarrier: Boolean,
     ): OutgoingInviteSdpOffer {
         val mediaOffer = buildMediaOffer(
             logTag = logTag,
@@ -42,24 +40,14 @@ internal object SipOutgoingInviteSdp {
             localHost = localHost,
             singtelStockOutgoingCarrier = singtelStockOutgoingCarrier,
         )
-        val compactSdp =
-            if (chinaUnicomStockOutgoingCarrier) {
-                buildChinaUnicomCompactBody(
-                    rtpSocket = rtpSocket,
-                    mediaOffer = mediaOffer,
-                    ipType = ipType,
-                    localHost = localHost,
-                )
-            } else {
-                buildSingTelCompactBody(
-                    rtpSocket = rtpSocket,
-                    mediaOffer = mediaOffer,
-                    ipType = ipType,
-                    localHost = localHost,
-                )
-            }
-        val inviteBody = if (compactProtectedOutgoingInvite) {
-            compactSdp
+        val singtelCompactSdp = buildSingTelCompactBody(
+            rtpSocket = rtpSocket,
+            mediaOffer = mediaOffer,
+            ipType = ipType,
+            localHost = localHost,
+        )
+        val inviteBody = if (singtelStockOutgoingCarrier) {
+            singtelCompactSdp
         } else {
             genericSdp
         }
@@ -184,33 +172,6 @@ internal object SipOutgoingInviteSdp {
             "a=rtpmap:$amrNbTrack AMR/8000",
             "a=fmtp:$amrNbTrack octet-align=0",
             "a=ptime:20",
-            "a=sendrecv",
-        ).joinToString("\r\n")
-            .plus("\r\n")
-            .toByteArray(Charsets.US_ASCII)
-    }
-
-    private fun buildChinaUnicomCompactBody(
-        rtpSocket: DatagramSocket,
-        mediaOffer: OutgoingInviteSdpMediaOffer,
-        ipType: String,
-        localHost: String,
-    ): ByteArray {
-        val amrNbTrack = mediaOffer.amrNbTrack
-        return listOf(
-            "v=0",
-            "o=- 1 2 IN $ipType $localHost",
-            "s=-",
-            "c=IN $ipType $localHost",
-            "t=0 0",
-            "m=audio ${rtpSocket.localPort} RTP/AVP $amrNbTrack",
-            "a=rtpmap:$amrNbTrack AMR/8000",
-            "a=fmtp:$amrNbTrack octet-align=0",
-            "a=ptime:20",
-            "a=curr:qos local none",
-            "a=curr:qos remote none",
-            "a=des:qos optional local sendrecv",
-            "a=des:qos optional remote sendrecv",
             "a=sendrecv",
         ).joinToString("\r\n")
             .plus("\r\n")

@@ -1,14 +1,18 @@
 package me.phh.sip
 
 internal object SipOutgoingInviteRetryPolicy {
-    fun responseWarnsIllegalSdp(response: SipResponse): Boolean {
-        if (response.statusCode != 400) return false
+    fun responseWarnsIllegalSdp(
+        response: SipResponse,
+        policy: SipInviteFailurePolicy = SipInviteFailurePolicy(),
+    ): Boolean {
+        if (response.statusCode !in policy.retryIllegalSdpStatusCodes) return false
         val warningValues = response.headers.entries
             .filter { it.key.equals("warning", ignoreCase = true) }
             .flatMap { it.value }
         return warningValues.any { warning ->
-            warning.contains("SDP is illegal", ignoreCase = true) ||
-                warning.contains("illegal SDP", ignoreCase = true)
+            policy.retryIllegalSdpWarningSubstrings.any { token ->
+                warning.contains(token, ignoreCase = true)
+            }
         }
     }
 

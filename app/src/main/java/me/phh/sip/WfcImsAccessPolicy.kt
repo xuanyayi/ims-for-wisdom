@@ -60,8 +60,13 @@ internal object WfcImsAccessPolicy {
         }
 
         val waitingForIwlan = wifiOnly && registeredOverLte
-        val waitingForCellular = !wifiPreferredOrOnly && registeredOverIwlan
-        return waitingForIwlan || waitingForCellular
+
+        // Cellular preferred is not cellular-only. If IMS is already registered
+        // over IWLAN, allow the call to use VoWiFi instead of rejecting it
+        // during the convergence window. Otherwise mobile-preferred WFC can
+        // block calls exactly when the modem has no usable cellular IMS path
+        // and the framework correctly selected VoWiFi as fallback.
+        return waitingForIwlan
     }
 
     fun shouldPreferIwlanForImsAccessNow(snapshot: Snapshot): Boolean {

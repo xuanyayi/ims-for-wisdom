@@ -175,12 +175,26 @@ internal object SipIncomingInviteMediaSelector {
             amrWbMediaCodecAvailable = amrWbMediaCodecAvailable,
         )
 
-        val (amrTrack, amrTrackDesc) = lookTrackMatching(
+        val preferredAmrNbTrack = if (selectedAudioCodec == SipAudioCodecs.AMR_NB) {
+            lookTrackMatching(
+                SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
+                additional = "mode-set=7",
+                notAdditional = "octet-align=1",
+            )
+        } else {
+            null
+        }
+        val (amrTrack, amrTrackDesc) = preferredAmrNbTrack ?: lookTrackMatching(
             SipAudioCodecNegotiator.speechCodecRtpmapName(selectedAudioCodec),
             additional = "",
             notAdditional = "octet-align=1",
         ) ?: return null
         val amrTrackRequirements = trackRequirements(amrTrack)
+        Rlog.d(
+            logTag,
+            "Selected incoming speech payload track=$amrTrack codec=${selectedAudioCodec.name} " +
+                "desc=$amrTrackDesc fmtp=${amrTrackRequirements.orEmpty()} callId=$incomingCallId",
+        )
         val amrFmtpAnswer = amrTrackRequirements ?: SipAudioCodecNegotiator.defaultSpeechFmtpAnswer(amrTrack, selectedAudioCodec)
 
         val (dtmfTrack, dtmfTrackDesc) =
