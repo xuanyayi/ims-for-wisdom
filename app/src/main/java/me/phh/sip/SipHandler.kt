@@ -4610,6 +4610,19 @@ fun onWfcDisabled(reason: String) {
                 return false
             }
 
+            if (response.statusCode == 491 &&
+                failedCseq.contains("UPDATE", ignoreCase = true) &&
+                (activeCallId == failedCallId || pendingCallId == failedCallId)
+            ) {
+                Rlog.w(
+                    TAG,
+                    "Ignoring recoverable outgoing UPDATE glare: " +
+                        "status=${response.statusCode} ${response.statusString} " +
+                        "cseq=$failedCseq callId=$failedCallId",
+                )
+                return false
+            }
+
             maybeScheduleCarrierConfiguredOutgoingInviteFinalFailureRecovery(
                 response = response,
                 failedCseq = failedCseq,
