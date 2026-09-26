@@ -13,7 +13,7 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
         private const val TAG = "Phh ImsSms"
     }
 
-    lateinit var sipHandler: SipHandler
+    var sipHandler: SipHandler? = null
 
     // phone -> outside API
     override fun sendSms(
@@ -44,7 +44,8 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
                 )
                 return
             }
-            if (::sipHandler.isInitialized == false) {
+            val handler = sipHandler
+            if (handler == null) {
                 onSendSmsResultError(
                     token,
                     messageRef,
@@ -54,7 +55,7 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
                 )
                 return
             }
-            sipHandler.sendSms(
+            handler.sendSms(
                 smsc,
                 pdu,
                 messageRef,
@@ -92,13 +93,24 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
         // called when android acks a received sms
         Rlog.d(TAG, "$slotId acknowledgeSms $token, $messageRef, $result")
 
+        val handler = sipHandler
+        if (handler == null) {
+            Rlog.w(TAG, "$slotId acknowledgeSms: sipHandler is null, ignoring ACK token=$token ref=$messageRef")
+            return
+        }
+
         // open notification on error?
         val error = result != ImsSmsImplBase.DELIVER_STATUS_OK
-        sipHandler.sendSmsAck(token, messageRef, error)
+        handler.sendSmsAck(token, messageRef, error)
     }
     override fun acknowledgeSmsReport(token: Int, messageRef: Int, result: Int) {
         // called when android acks onSmsStatusReportReceived?
         Rlog.d(TAG, "$slotId acknowledgeSmsReport $token, $messageRef, $result")
+    }
+
+    fun retire() {
+        Rlog.d(TAG, "$slotId retiring PhhImsSms")
+        sipHandler = null
     }
     override fun onReady() {
         // should not do anything before this is called

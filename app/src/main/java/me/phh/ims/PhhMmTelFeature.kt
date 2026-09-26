@@ -151,16 +151,18 @@ class PhhMmTelFeature(
                 recomputeEnabledMmTelCapabilitiesLocked()
             }
         }
-        val finalCapabilities = configuredCapabilities or
-            if (sipRegistrationReadyForCapabilities) {
-                MmTelCapabilities.CAPABILITY_TYPE_SMS
-            } else {
-                0
-            }
+        val supportedCapabilities = configuredCapabilities and
+            (MmTelCapabilities.CAPABILITY_TYPE_VOICE or MmTelCapabilities.CAPABILITY_TYPE_SMS)
+
+        val finalCapabilities = if (sipRegistrationReadyForCapabilities) {
+            supportedCapabilities
+        } else {
+            0
+        }
         Rlog.i(
             TAG,
             "Final MMTEL capabilities=$finalCapabilities registrationTech=$registrationTech " +
-                "reason=$reason perTech=$enabledMmTelCapabilitiesByRadioTech"
+                "ready=$sipRegistrationReadyForCapabilities reason=$reason perTech=$enabledMmTelCapabilitiesByRadioTech"
         )
         notifyCapabilitiesStatusChanged(
             android.telephony.ims.feature.MmTelFeature.MmTelCapabilities(finalCapabilities)
@@ -180,17 +182,31 @@ class PhhMmTelFeature(
         request: android.telephony.ims.feature.CapabilityChangeRequest,
         callback: PhhMmTelFeatureProtected.CapabilityChangeCallback
     ) {
+        val supportedMask = MmTelCapabilities.CAPABILITY_TYPE_VOICE or MmTelCapabilities.CAPABILITY_TYPE_SMS
         for (pair in request.capabilitiesToEnable) {
-            Rlog.i(
-                TAG,
-                "Enabling MMTEL capability=${pair.capability} radioTech=${pair.radioTech}"
-            )
-            setMmTelCapabilityForRadioTech(pair.capability, pair.radioTech, true)
-            callback.onChangeCapabilityConfigurationError(
-                pair.capability,
-                pair.radioTech,
-                android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS
-            )
+            val supported = (pair.capability and supportedMask) != 0
+            if (supported) {
+                Rlog.i(
+                    TAG,
+                    "Enabling MMTEL capability=${pair.capability} radioTech=${pair.radioTech}"
+                )
+                setMmTelCapabilityForRadioTech(pair.capability, pair.radioTech, true)
+                callback.onChangeCapabilityConfigurationError(
+                    pair.capability,
+                    pair.radioTech,
+                    android.telephony.ims.feature.ImsFeature.CAPABILITY_SUCCESS
+                )
+            } else {
+                Rlog.w(
+                    TAG,
+                    "Rejecting unsupported MMTEL capability=${pair.capability} radioTech=${pair.radioTech}"
+                )
+                callback.onChangeCapabilityConfigurationError(
+                    pair.capability,
+                    pair.radioTech,
+                    android.telephony.ims.feature.ImsFeature.CAPABILITY_ERROR_GENERIC
+                )
+            }
         }
         for (pair in request.capabilitiesToDisable) {
             Rlog.i(
@@ -414,6 +430,8 @@ class PhhMmTelFeature(
     }
 
     private fun retireSipHandler(reason: String) {
+        sipRegistrationReadyForCapabilities = false
+        imsSms.retire()
         if (
             this::sipHandler.isInitialized &&
             SubscriptionManager.isValidSubscriptionId(sipHandlerSubId)
@@ -426,6 +444,7 @@ class PhhMmTelFeature(
         }
 
         sipHandlerSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+        refreshMmTelCapabilities("retireSipHandler: $reason")
     }
 
     private fun unregisterReadyCheckCallback(reason: String) {
@@ -1063,8 +1082,9 @@ class PhhMmTelFeature(
         val imsService = PhhImsService.Companion.instance!!
         sipHandlerSubId = subId
         sipHandler = SipHandler(imsService, slotId, subId)
-sipHandler.imsFailureCallback = {
+        sipHandler.imsFailureCallback = {
             sipRegistrationReadyForCapabilities = false
+            refreshMmTelCapabilities("SIP failure")
             imsService.getRegistrationForSubscription(slotId, subId).onDeregistered(null)
         }
         sipHandler.imsRegisteringCallback = { tech ->
